@@ -38,6 +38,7 @@ import (
 
 	k8siblev1alpha1 "github.com/bensonphillipsiv/k8sible.git/api/v1alpha1"
 	"github.com/bensonphillipsiv/k8sible.git/internal/controller"
+	"github.com/bensonphillipsiv/k8sible.git/internal/git"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -185,9 +186,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	gitClient := git.NewClient()
+
 	if err := (&controller.K8sibleWorkflowReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		GitClient: gitClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "K8sibleWorkflow")
 		os.Exit(1)
