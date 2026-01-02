@@ -26,30 +26,15 @@ import (
 type GitSourceSpec struct {
 	Repository string `json:"repository"`
 	Reference  string `json:"reference,omitempty"`
-	Path       string `json:"path"`
+}
+type ApplySpec struct {
+	Path     string `json:"path"`
+	Schedule string `json:"schedule,omitempty"`
 }
 
 type ReconcileSpec struct {
-	// source defines the Git repository source for the reconcile workflow
-	Source   GitSourceSpec `json:"source"`
-	Schedule string        `json:"schedule,omitempty"`
-}
-
-// GetEffectiveSource returns the source with values inherited from the parent workflow source
-func (r *ReconcileSpec) GetReconcileSource(parentSource GitSourceSpec) GitSourceSpec {
-	effective := r.Source
-
-	// Inherit repository if not specified
-	if effective.Repository == "" {
-		effective.Repository = parentSource.Repository
-	}
-
-	// Inherit reference if not specified
-	if effective.Reference == "" {
-		effective.Reference = parentSource.Reference
-	}
-
-	return effective
+	Path     string `json:"path"`
+	Schedule string `json:"schedule,omitempty"`
 }
 
 // K8sibleWorkflowSpec defines the desired state of K8sibleWorkflow
@@ -60,9 +45,8 @@ type K8sibleWorkflowSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// source defines the Git repository source for the k8sible workflow
-	Source   GitSourceSpec `json:"source"`
-	Schedule string        `json:"schedule,omitempty"`
-
+	Source    GitSourceSpec  `json:"source"`
+	Apply     ApplySpec      `json:"apply"`
 	Reconcile *ReconcileSpec `json:"reconcile,omitempty"`
 }
 

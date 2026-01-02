@@ -1,0 +1,23 @@
+---
+- name: Test K8sible Workflow
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Print hello message
+      ansible.builtin.debug:
+        msg: "Hello from apply K8sible!"
+
+    - name: Print current date
+      ansible.builtin.debug:
+        msg: "The current timestamp is {{ now() }}"
+
+    - name: Create a test file
+      ansible.builtin.copy:
+        content: "K8sible test successful!"
+        dest: /tmp/k8sible-test.txt
+
+    - name: Print success message
+      ansible.builtin.debug:
+        msg: "Playbook completed successfully!"

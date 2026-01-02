@@ -9,12 +9,9 @@ spec:
   source:
     repository: https://github.com/bensonphillipsiv/k8sible
     reference: main
-    path: test/ansible/test_ansible.yaml
-  schedule: "0 2 * * *"
+  apply:
+    path: test/ansible/apply_ansible.yaml
+    schedule: "0 2 * * *"
   reconcile:
-    source:
-      path: examples/sample-reconcile
+    path: test/ansible/reconcile_ansible.yaml
     schedule: "0 3 * * *"
-
-  secretRef:
-    name: k8sible-creds

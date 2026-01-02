@@ -39,44 +39,37 @@ spec:
           spec:
             description: spec defines the desired state of K8sibleWorkflow
             properties:
-              reconcile:
+              apply:
                 properties:
+                  path:
+                    type: string
                   schedule:
                     type: string
-                  source:
-                    description: source defines the Git repository source for the
-                      reconcile workflow
-                    properties:
-                      path:
-                        type: string
-                      reference:
-                        type: string
-                      repository:
-                        type: string
-                    required:
-                    - path
-                    - repository
-                    type: object
                 required:
-                - source
+                - path
                 type: object
-              schedule:
-                type: string
+              reconcile:
+                properties:
+                  path:
+                    type: string
+                  schedule:
+                    type: string
+                required:
+                - path
+                type: object
               source:
                 description: source defines the Git repository source for the k8sible
                   workflow
                 properties:
-                  path:
-                    type: string
                   reference:
                     type: string
                   repository:
                     type: string
                 required:
-                - path
                 - repository
                 type: object
             required:
+            - apply
             - source
             type: object
           status:
