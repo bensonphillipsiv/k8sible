@@ -18,10 +18,14 @@ package controller
 
 import (
 	"context"
+	"path/filepath"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	k8siblev1alpha1 "github.com/bensonphillipsiv/k8sible.git/api/v1alpha1"
@@ -38,6 +42,8 @@ type K8sibleWorkflowReconciler struct {
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -72,12 +78,59 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"path", source.Path)
 		return ctrl.Result{}, err
 	}
-
 	l.Info("Fetched file contents",
 		"path", source.Path,
 		"contents", contents)
 
+	if err := r.reconcileConfigMap(ctx, config, contents); err != nil {
+		l.Error(err, "failed to reconcile ConfigMap")
+		return ctrl.Result{}, err
+	}
+	l.Info("Successfully reconciled ConfigMap",
+		"configmap", config.Name+"-workflow")
+
 	return ctrl.Result{}, nil
+}
+
+// reconcileConfigMap creates or updates a ConfigMap with the workflow file contents
+func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string) error {
+	configMapName := workflow.Name + "-workflow"
+	fileName := filepath.Base(workflow.Spec.Source.Path)
+
+	// Define the desired ConfigMap
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: workflow.Namespace,
+		},
+	}
+
+	// Create or update the ConfigMap
+	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, configMap, func() error {
+		// Set the data
+		configMap.Data = map[string]string{
+			fileName: contents,
+		}
+
+		// Set labels
+		configMap.Labels = map[string]string{
+			"app.kubernetes.io/managed-by": "k8sible",
+			"app.kubernetes.io/name":       workflow.Name,
+		}
+
+		// Set the owner reference so the ConfigMap is deleted when the workflow is deleted
+		return controllerutil.SetControllerReference(workflow, configMap, r.Scheme)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	logf.FromContext(ctx).Info("ConfigMap reconciled",
+		"configmap", configMapName,
+		"operation", result)
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -13,7 +13,8 @@ spec:
   schedule: "0 2 * * *"
   reconcile:
     source:
-      repository: https://github.com/bensonphillipsiv/k8sible.git
-      reference: main
       path: examples/sample-reconcile
     schedule: "0 3 * * *"
+
+  secretRef:
+    name: k8sible-creds
