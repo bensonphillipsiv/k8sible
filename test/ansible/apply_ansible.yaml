@@ -21,3 +21,7 @@
     - name: Print success message
       ansible.builtin.debug:
         msg: "Playbook completed successfully!"
+
+    - name: Sleep some
+      ansible.builtin.pause:
+        seconds: 45

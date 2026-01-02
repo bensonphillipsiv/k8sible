@@ -67,6 +67,11 @@ type K8sibleWorkflowStatus struct {
 	// - "Degraded": the resource failed to reach or maintain its desired state
 	//
 	// The status of each condition is one of True, False, or Unknown.
+
+	// PendingPlaybooks is a list of playbook types waiting to be executed
+	// +optional
+	PendingPlaybooks []string `json:"pendingPlaybooks,omitempty"`
+
 	// +listType=map
 	// +listMapKey=type
 	// +optional

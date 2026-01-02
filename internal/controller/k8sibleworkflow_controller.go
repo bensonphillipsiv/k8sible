@@ -49,6 +49,7 @@ type K8sibleWorkflowReconciler struct {
 	GitClient *git.Client
 }
 
+// Playbook represents a playbook source and its type
 type Playbook struct {
 	Source git.Source
 	Type   string // "apply" or "reconcile"
@@ -81,23 +82,23 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return workflow.Spec.Reconcile.Path
 			}
 			return "<none>"
-		}())
+		}(),
+		"pendingPlaybooks", workflow.Status.PendingPlaybooks)
 
-	// Build list of sources to fetch
-	sources := []Playbook{}
-
-	sources = append(sources, Playbook{
-		Source: git.Source{
-			Repository: workflow.Spec.Source.Repository,
-			Reference:  workflow.Spec.Source.Reference,
-			Path:       workflow.Spec.Apply.Path,
+	// Build list of playbooks to fetch
+	playbooks := []Playbook{
+		{
+			Source: git.Source{
+				Repository: workflow.Spec.Source.Repository,
+				Reference:  workflow.Spec.Source.Reference,
+				Path:       workflow.Spec.Apply.Path,
+			},
+			Type: "apply",
 		},
-		Type: "apply",
-	})
+	}
 
-	// Optionally add reconcile source
 	if workflow.Spec.Reconcile != nil {
-		sources = append(sources, Playbook{
+		playbooks = append(playbooks, Playbook{
 			Source: git.Source{
 				Repository: workflow.Spec.Source.Repository,
 				Reference:  workflow.Spec.Source.Reference,
@@ -107,8 +108,17 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		})
 	}
 
-	// Process all sources
-	for _, playbook := range sources {
+	// Build a map of playbooks for easy lookup
+	playbookMap := make(map[string]Playbook)
+	for _, p := range playbooks {
+		playbookMap[p.Type] = p
+	}
+
+	// Track if status needs updating
+	statusUpdated := false
+
+	// Process all playbooks - reconcile ConfigMaps and track pending jobs
+	for _, playbook := range playbooks {
 		contents, err := r.GitClient.FetchFile(ctx, playbook.Source)
 		if err != nil {
 			l.Error(err, "failed to fetch file from source",
@@ -131,22 +141,87 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"configmap", configMapName,
 			"updated", updated)
 
-		if updated {
-			// Reconcile the Job
-			if err := r.reconcileJob(ctx, workflow, configMapName, playbook); err != nil {
-				l.Error(err, "failed to reconcile Job")
+		// If ConfigMap was updated, add to pending playbooks
+		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
+			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
+			statusUpdated = true
+			l.Info("Added playbook to pending queue",
+				"type", playbook.Type,
+				"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+		}
+	}
+
+	// Check if any job is currently running for this workflow
+	running, err := r.isAnyJobRunning(ctx, workflow)
+	if err != nil {
+		l.Error(err, "failed to check for running jobs")
+		return ctrl.Result{}, err
+	}
+
+	if running {
+		l.Info("A job is still running, will requeue to process pending jobs later",
+			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+
+		// Update status if needed before returning
+		if statusUpdated {
+			if err := r.Status().Update(ctx, workflow); err != nil {
+				l.Error(err, "failed to update workflow status")
 				return ctrl.Result{}, err
 			}
-			l.Info("Successfully reconciled Job", "job", "ansible-"+workflow.Name+"-job")
 		}
 
-		// // Handle differently based on type
-		// switch s.SourceType {
-		// case "apply":
-		// 	// Handle apply source
-		// case "reconcile":
-		// 	// Handle reconcile source
-		// }
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	}
+
+	// No job running, process the first pending playbook (if any)
+	if len(workflow.Status.PendingPlaybooks) > 0 {
+		pendingType := workflow.Status.PendingPlaybooks[0]
+		playbook, ok := playbookMap[pendingType]
+		if !ok {
+			l.Error(nil, "pending playbook type not found in playbook map",
+				"type", pendingType)
+			// Remove invalid entry from pending list
+			workflow.Status.PendingPlaybooks = workflow.Status.PendingPlaybooks[1:]
+			if err := r.Status().Update(ctx, workflow); err != nil {
+				l.Error(err, "failed to update workflow status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		configMapName := workflow.Name + "-" + playbook.Type
+
+		// Create the job
+		if err := r.reconcileJob(ctx, workflow, configMapName, playbook); err != nil {
+			l.Error(err, "failed to reconcile Job")
+			return ctrl.Result{}, err
+		}
+		l.Info("Successfully created Job",
+			"type", playbook.Type,
+			"configmap", configMapName)
+
+		// Remove from pending list
+		workflow.Status.PendingPlaybooks = workflow.Status.PendingPlaybooks[1:]
+		statusUpdated = true
+
+		l.Info("Removed playbook from pending queue",
+			"type", playbook.Type,
+			"remainingPending", workflow.Status.PendingPlaybooks)
+	}
+
+	// Update status if needed
+	if statusUpdated {
+		if err := r.Status().Update(ctx, workflow); err != nil {
+			l.Error(err, "failed to update workflow status")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Requeue sooner if there are still pending playbooks
+	if len(workflow.Status.PendingPlaybooks) > 0 {
+		l.Info("More playbooks pending, will requeue to check job status",
+			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
 	return ctrl.Result{RequeueAfter: time.Minute * 3}, nil
@@ -158,8 +233,41 @@ func computeHash(content string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// contains checks if a string slice contains a specific string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// isAnyJobRunning checks if any job for this workflow is currently running
+func (r *K8sibleWorkflowReconciler) isAnyJobRunning(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) (bool, error) {
+	jobList := &batchv1.JobList{}
+	if err := r.List(ctx, jobList,
+		client.InNamespace(workflow.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/k8sible-workflow": workflow.Name,
+		}); err != nil {
+		return false, err
+	}
+
+	for _, job := range jobList.Items {
+		if job.Status.Active > 0 {
+			logf.FromContext(ctx).Info("Found running job",
+				"job", job.Name,
+				"active", job.Status.Active)
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // reconcileConfigMap creates or updates a ConfigMap with the workflow file contents
-// Returns configMapName, fileName, whether it was updated, and any error
+// Returns configMapName, whether it was updated, and any error
 func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string, playbook Playbook) (string, bool, error) {
 	l := logf.FromContext(ctx)
 	configMapName := workflow.Name + "-" + playbook.Type
@@ -244,30 +352,11 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, configMapName string, playbook Playbook) error {
 	l := logf.FromContext(ctx)
 
-	// List existing jobs for this workflow
-	jobList := &batchv1.JobList{}
-	if err := r.List(ctx, jobList,
-		client.InNamespace(workflow.Namespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/k8sible-workflow": workflow.Name,
-			"app.kubernetes.io/k8sible-type":     playbook.Type,
-		}); err != nil {
-		return err
-	}
-
-	// Check if there's a running job
-	for _, job := range jobList.Items {
-		if job.Status.Active > 0 {
-			l.Info("Job is still running, skipping creation", "job", job.Name)
-			return nil
-		}
-	}
-
 	// Generate unique job name with timestamp
-	jobName := fmt.Sprintf("ansible-%s-%d", workflow.Name, time.Now().Unix())
+	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
 	fileName := filepath.Base(playbook.Source.Path)
 
-	l.Info("Creating new Job", "job", jobName)
+	l.Info("Creating new Job", "job", jobName, "type", playbook.Type)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -276,16 +365,17 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by":       "k8sible",
 				"app.kubernetes.io/k8sible-workflow": workflow.Name,
-				"app.kubernetes.io/k8sible-type":     playbook.Type, // "apply" or "reconcile"
+				"app.kubernetes.io/k8sible-type":     playbook.Type,
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: ptr(int32(3600)), // Auto-cleanup after 1 hour
+			TTLSecondsAfterFinished: ptr(int32(3600)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"app.kubernetes.io/managed-by":       "k8sible",
 						"app.kubernetes.io/k8sible-workflow": workflow.Name,
+						"app.kubernetes.io/k8sible-type":     playbook.Type,
 					},
 				},
 				Spec: corev1.PodSpec{
