@@ -7,7 +7,7 @@
   tasks:
     - name: Print hello message
       ansible.builtin.debug:
-        msg: "Hello from K8sible!"
+        msg: "Hello from K8sible! - is this hashed?"
 
     - name: Print current date
       ansible.builtin.debug:

@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -32,6 +34,10 @@ import (
 
 	k8siblev1alpha1 "github.com/bensonphillipsiv/k8sible.git/api/v1alpha1"
 	"github.com/bensonphillipsiv/k8sible.git/internal/git"
+)
+
+const (
+	contentHashAnnotation = "k8sible.io/content-hash"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
@@ -85,57 +91,113 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"contentLength", len(contents))
 
 	// Reconcile the ConfigMap
-	configMapName, fileName, err := r.reconcileConfigMap(ctx, workflow, contents)
+	configMapName, fileName, updated, err := r.reconcileConfigMap(ctx, workflow, contents)
 	if err != nil {
 		l.Error(err, "failed to reconcile ConfigMap")
 		return ctrl.Result{}, err
 	}
-	l.Info("Successfully reconciled ConfigMap", "configmap", configMapName)
+	l.Info("Successfully reconciled ConfigMap",
+		"configmap", configMapName,
+		"updated", updated)
 
-	// Reconcile the Job
-	if err := r.reconcileJob(ctx, workflow, configMapName, fileName); err != nil {
-		l.Error(err, "failed to reconcile Job")
-		return ctrl.Result{}, err
+	if updated {
+		// Reconcile the Job
+		if err := r.reconcileJob(ctx, workflow, configMapName, fileName); err != nil {
+			l.Error(err, "failed to reconcile Job")
+			return ctrl.Result{}, err
+		}
+		l.Info("Successfully reconciled Job", "job", "ansible-"+workflow.Name+"-job")
 	}
-	l.Info("Successfully reconciled Job", "job", "ansible-"+workflow.Name+"-job")
 
 	return ctrl.Result{}, nil
 }
 
+// computeHash generates a SHA256 hash of the content
+func computeHash(content string) string {
+	hash := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(hash[:])
+}
+
 // reconcileConfigMap creates or updates a ConfigMap with the workflow file contents
-func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string) (string, string, error) {
+// Returns configMapName, fileName, whether it was updated, and any error
+func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string) (string, string, bool, error) {
+	l := logf.FromContext(ctx)
 	configMapName := workflow.Name + "-workflow"
 	fileName := filepath.Base(workflow.Spec.Source.Path)
+	contentHash := computeHash(contents)
+
+	// Check if ConfigMap already exists
+	existingConfigMap := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: configMapName, Namespace: workflow.Namespace}, existingConfigMap)
+
+	if err == nil {
+		// ConfigMap exists, check if hash matches
+		existingHash := existingConfigMap.Annotations[contentHashAnnotation]
+		if existingHash == contentHash {
+			l.Info("ConfigMap content unchanged, skipping update",
+				"configmap", configMapName,
+				"hash", contentHash)
+			return configMapName, fileName, false, nil
+		}
+
+		// Hash doesn't match, update the ConfigMap
+		l.Info("ConfigMap content changed, updating",
+			"configmap", configMapName,
+			"oldHash", existingHash,
+			"newHash", contentHash)
+
+		existingConfigMap.Data = map[string]string{
+			fileName: contents,
+		}
+
+		if existingConfigMap.Annotations == nil {
+			existingConfigMap.Annotations = make(map[string]string)
+		}
+		existingConfigMap.Annotations[contentHashAnnotation] = contentHash
+
+		if err := r.Update(ctx, existingConfigMap); err != nil {
+			return "", "", false, err
+		}
+
+		return configMapName, fileName, true, nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return "", "", false, err
+	}
+
+	// ConfigMap doesn't exist, create it
+	l.Info("Creating new ConfigMap",
+		"configmap", configMapName,
+		"hash", contentHash)
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      configMapName,
 			Namespace: workflow.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "k8sible",
+				"app.kubernetes.io/name":       workflow.Name,
+			},
+			Annotations: map[string]string{
+				contentHashAnnotation: contentHash,
+			},
+		},
+		Data: map[string]string{
+			fileName: contents,
 		},
 	}
 
-	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, configMap, func() error {
-		configMap.Data = map[string]string{
-			fileName: contents,
-		}
-
-		configMap.Labels = map[string]string{
-			"app.kubernetes.io/managed-by": "k8sible",
-			"app.kubernetes.io/name":       workflow.Name,
-		}
-
-		return controllerutil.SetControllerReference(workflow, configMap, r.Scheme)
-	})
-
-	if err != nil {
-		return "", "", err
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(workflow, configMap, r.Scheme); err != nil {
+		return "", "", false, err
 	}
 
-	logf.FromContext(ctx).Info("ConfigMap reconciled",
-		"configmap", configMapName,
-		"operation", result)
+	if err := r.Create(ctx, configMap); err != nil {
+		return "", "", false, err
+	}
 
-	return configMapName, fileName, nil
+	return configMapName, fileName, true, nil
 }
 
 // reconcileJob creates a Job to run the Ansible playbook
@@ -146,17 +208,11 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 	existingJob := &batchv1.Job{}
 	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: workflow.Namespace}, existingJob)
 	if err == nil {
-		// Job already exists, check if it's completed or failed
-		if existingJob.Status.Succeeded > 0 || existingJob.Status.Failed > 0 {
-			logf.FromContext(ctx).Info("Job already completed, skipping creation",
-				"job", jobName,
-				"succeeded", existingJob.Status.Succeeded,
-				"failed", existingJob.Status.Failed)
+		// Check if Job is still running
+		if existingJob.Status.Active > 0 {
+			logf.FromContext(ctx).Info("Job is still running", "job", jobName)
 			return nil
 		}
-		// Job is still running
-		logf.FromContext(ctx).Info("Job is still running", "job", jobName)
-		return nil
 	}
 
 	if !apierrors.IsNotFound(err) {
