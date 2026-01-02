@@ -7,9 +7,9 @@ metadata:
   namespace: k8sible
 spec:
   source:
-    repository: https://github.com/bensonphillipsiv/k8sible.git
+    repository: https://github.com/bensonphillipsiv/k8sible
     reference: main
-    path: examples/sample-workflow
+    path: test/ansible/test_ansible.yaml
   schedule: "0 2 * * *"
   reconcile:
     source:
