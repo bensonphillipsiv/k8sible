@@ -20,7 +20,9 @@ import (
 	"context"
 	"path/filepath"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,27 +52,27 @@ type K8sibleWorkflowReconciler struct {
 func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := logf.FromContext(ctx)
 
-	config := &k8siblev1alpha1.K8sibleWorkflow{}
-	if err := r.Get(ctx, req.NamespacedName, config); err != nil {
+	workflow := &k8siblev1alpha1.K8sibleWorkflow{}
+	if err := r.Get(ctx, req.NamespacedName, workflow); err != nil {
 		l.Error(err, "unable to fetch K8sibleWorkflow")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	l.Info("K8sibleWorkflow Source",
-		"name", config.Name,
-		"repo", config.Spec.Source.Repository,
-		"path", config.Spec.Source.Path,
-		"reference", config.Spec.Source.Reference,
-		"schedule", config.Spec.Schedule)
+	l.Info("K8sibleWorkflow",
+		"name", workflow.Name,
+		"repo", workflow.Spec.Source.Repository,
+		"path", workflow.Spec.Source.Path,
+		"reference", workflow.Spec.Source.Reference,
+		"schedule", workflow.Spec.Schedule)
 
 	// Convert to git.Source
 	source := git.Source{
-		Repository: config.Spec.Source.Repository,
-		Path:       config.Spec.Source.Path,
-		Reference:  config.Spec.Source.Reference,
+		Repository: workflow.Spec.Source.Repository,
+		Path:       workflow.Spec.Source.Path,
+		Reference:  workflow.Spec.Source.Reference,
 	}
 
-	// Fetch and log the file contents from the source
+	// Fetch the file contents from the source
 	contents, err := r.GitClient.FetchFile(ctx, source)
 	if err != nil {
 		l.Error(err, "failed to fetch file from source",
@@ -80,24 +82,31 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 	l.Info("Fetched file contents",
 		"path", source.Path,
-		"contents", contents)
+		"contentLength", len(contents))
 
-	if err := r.reconcileConfigMap(ctx, config, contents); err != nil {
+	// Reconcile the ConfigMap
+	configMapName, fileName, err := r.reconcileConfigMap(ctx, workflow, contents)
+	if err != nil {
 		l.Error(err, "failed to reconcile ConfigMap")
 		return ctrl.Result{}, err
 	}
-	l.Info("Successfully reconciled ConfigMap",
-		"configmap", config.Name+"-workflow")
+	l.Info("Successfully reconciled ConfigMap", "configmap", configMapName)
+
+	// Reconcile the Job
+	if err := r.reconcileJob(ctx, workflow, configMapName, fileName); err != nil {
+		l.Error(err, "failed to reconcile Job")
+		return ctrl.Result{}, err
+	}
+	l.Info("Successfully reconciled Job", "job", "ansible-"+workflow.Name+"-job")
 
 	return ctrl.Result{}, nil
 }
 
 // reconcileConfigMap creates or updates a ConfigMap with the workflow file contents
-func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string) error {
+func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string) (string, string, error) {
 	configMapName := workflow.Name + "-workflow"
 	fileName := filepath.Base(workflow.Spec.Source.Path)
 
-	// Define the desired ConfigMap
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      configMapName,
@@ -105,31 +114,116 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 		},
 	}
 
-	// Create or update the ConfigMap
 	result, err := controllerutil.CreateOrUpdate(ctx, r.Client, configMap, func() error {
-		// Set the data
 		configMap.Data = map[string]string{
 			fileName: contents,
 		}
 
-		// Set labels
 		configMap.Labels = map[string]string{
 			"app.kubernetes.io/managed-by": "k8sible",
 			"app.kubernetes.io/name":       workflow.Name,
 		}
 
-		// Set the owner reference so the ConfigMap is deleted when the workflow is deleted
 		return controllerutil.SetControllerReference(workflow, configMap, r.Scheme)
 	})
 
 	if err != nil {
-		return err
+		return "", "", err
 	}
 
 	logf.FromContext(ctx).Info("ConfigMap reconciled",
 		"configmap", configMapName,
 		"operation", result)
 
+	return configMapName, fileName, nil
+}
+
+// reconcileJob creates a Job to run the Ansible playbook
+func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, configMapName, fileName string) error {
+	jobName := "ansible-" + workflow.Name + "-job"
+
+	// Check if job already exists
+	existingJob := &batchv1.Job{}
+	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: workflow.Namespace}, existingJob)
+	if err == nil {
+		// Job already exists, check if it's completed or failed
+		if existingJob.Status.Succeeded > 0 || existingJob.Status.Failed > 0 {
+			logf.FromContext(ctx).Info("Job already completed, skipping creation",
+				"job", jobName,
+				"succeeded", existingJob.Status.Succeeded,
+				"failed", existingJob.Status.Failed)
+			return nil
+		}
+		// Job is still running
+		logf.FromContext(ctx).Info("Job is still running", "job", jobName)
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// Create the Job
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: workflow.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "k8sible",
+				"app.kubernetes.io/name":       workflow.Name,
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "k8sible",
+						"app.kubernetes.io/name":       workflow.Name,
+					},
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "ansible",
+							Image:   "quay.io/ansible/ansible-runner:latest",
+							Command: []string{"ansible-playbook"},
+							Args:    []string{"/playbook/" + fileName},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "playbook",
+									MountPath: "/playbook",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "playbook",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: configMapName,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(workflow, job, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, job); err != nil {
+		return err
+	}
+
+	logf.FromContext(ctx).Info("Job created", "job", jobName)
 	return nil
 }
 
@@ -137,6 +231,8 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 func (r *K8sibleWorkflowReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k8siblev1alpha1.K8sibleWorkflow{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&batchv1.Job{}).
 		Named("k8sibleworkflow").
 		Complete(r)
 }
