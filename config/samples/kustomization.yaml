@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- k8sible_v1alpha1_k8sibleworkflow.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

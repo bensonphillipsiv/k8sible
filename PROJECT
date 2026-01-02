@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: k8sible
 repo: github.com/bensonphillipsiv/k8sible.git
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: core.k8sible.io
+  group: k8sible
+  kind: K8sibleWorkflow
+  path: github.com/bensonphillipsiv/k8sible.git/api/v1alpha1
+  version: v1alpha1
 version: "3"

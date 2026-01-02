@@ -1,0 +1,19 @@
+apiVersion: k8sible.core.k8sible.io/v1alpha1
+kind: K8sibleWorkflow
+metadata:
+  labels:
+    app.kubernetes.io/name: k8sible
+  name: k8sibleworkflow-sample-2
+  namespace: k8sible
+spec:
+  source:
+    repository: https://github.com/bensonphillipsiv/k8sible.git
+    reference: main
+    path: examples/sample-workflow
+  schedule: "0 2 * * *"
+  reconcile:
+    source:
+      repository: https://github.com/bensonphillipsiv/k8sible.git
+      reference: main
+      path: examples/sample-reconcile
+    schedule: "0 3 * * *"

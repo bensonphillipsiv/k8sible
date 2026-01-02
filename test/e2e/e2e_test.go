@@ -174,13 +174,13 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=k8sible-metrics-reader",
+			By("creating a RoleBinding for the service account to allow access to metrics")
+			cmd := exec.Command("kubectl", "create", "rolebinding", metricsRoleBindingName,
+				"--role=k8sible-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
 			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			Expect(err).NotTo(HaveOccurred(), "Failed to create RoleBinding")
 
 			By("validating that the metrics service is available")
 			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
