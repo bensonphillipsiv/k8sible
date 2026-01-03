@@ -360,8 +360,9 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 			Name:      configMapName,
 			Namespace: workflow.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "k8sible",
-				"app.kubernetes.io/name":       workflow.Name,
+				"app.kubernetes.io/managed-by":   "k8sible",
+				"app.kubernetes.io/name":         workflow.Name,
+				"app.kubernetes.io/k8sible-type": playbook.Type,
 			},
 			Annotations: map[string]string{
 				contentHashAnnotation: contentHash,
