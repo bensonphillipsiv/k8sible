@@ -40,26 +40,33 @@ spec:
             description: spec defines the desired state of K8sibleWorkflow
             properties:
               apply:
+                description: Apply defines the apply playbook configuration
                 properties:
                   path:
+                    description: Path is the path to the playbook file in the repository
                     type: string
                   schedule:
+                    description: Schedule is an optional cron schedule for running
+                      the playbook
                     type: string
                 required:
                 - path
                 type: object
               reconcile:
+                description: Reconcile defines the optional reconcile playbook configuration
                 properties:
                   path:
+                    description: Path is the path to the playbook file in the repository
                     type: string
                   schedule:
+                    description: Schedule is an optional cron schedule for running
+                      the playbook
                     type: string
                 required:
                 - path
                 type: object
               source:
-                description: source defines the Git repository source for the k8sible
-                  workflow
+                description: Source defines the git repository source
                 properties:
                   reference:
                     type: string

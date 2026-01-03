@@ -23,7 +23,7 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-type GitSourceSpec struct {
+type SourceSpec struct {
 	Repository string `json:"repository"`
 	Reference  string `json:"reference,omitempty"`
 }
@@ -37,17 +37,27 @@ type ReconcileSpec struct {
 	Schedule string `json:"schedule,omitempty"`
 }
 
+// PlaybookSpec defines a playbook configuration
+type PlaybookSpec struct {
+	// Path is the path to the playbook file in the repository
+	Path string `json:"path"`
+
+	// Schedule is an optional cron schedule for running the playbook
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+}
+
 // K8sibleWorkflowSpec defines the desired state of K8sibleWorkflow
 type K8sibleWorkflowSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// Source defines the git repository source
+	Source SourceSpec `json:"source"`
 
-	// source defines the Git repository source for the k8sible workflow
-	Source    GitSourceSpec  `json:"source"`
-	Apply     ApplySpec      `json:"apply"`
-	Reconcile *ReconcileSpec `json:"reconcile,omitempty"`
+	// Apply defines the apply playbook configuration
+	Apply PlaybookSpec `json:"apply"`
+
+	// Reconcile defines the optional reconcile playbook configuration
+	// +optional
+	Reconcile *PlaybookSpec `json:"reconcile,omitempty"`
 }
 
 // K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.

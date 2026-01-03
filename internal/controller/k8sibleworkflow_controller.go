@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -51,8 +52,9 @@ type K8sibleWorkflowReconciler struct {
 
 // Playbook represents a playbook source and its type
 type Playbook struct {
-	Source git.Source
-	Type   string // "apply" or "reconcile"
+	Source   git.Source
+	Type     string // "apply" or "reconcile"
+	Schedule string // cron schedule (optional)
 }
 
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows,verbs=get;list;watch;create;update;patch;delete
@@ -60,6 +62,7 @@ type Playbook struct {
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -77,13 +80,11 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"repo", workflow.Spec.Source.Repository,
 		"ref", workflow.Spec.Source.Reference,
 		"applyPath", workflow.Spec.Apply.Path,
-		"reconcilePath", func() string {
-			if workflow.Spec.Reconcile != nil {
-				return workflow.Spec.Reconcile.Path
-			}
-			return "<none>"
-		}(),
-		"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+		"applySchedule", workflow.Spec.Apply.Schedule,
+		"reconcilePath", workflow.Spec.Reconcile.Path,
+		"reconcileSchedule", workflow.Spec.Reconcile.Schedule,
+		"pendingPlaybooks", workflow.Status.PendingPlaybooks,
+	)
 
 	// Build list of playbooks to fetch
 	playbooks := []Playbook{
@@ -93,7 +94,8 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Apply.Path,
 			},
-			Type: "apply",
+			Type:     "apply",
+			Schedule: workflow.Spec.Apply.Schedule,
 		},
 	}
 
@@ -104,7 +106,8 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Reconcile.Path,
 			},
-			Type: "reconcile",
+			Type:     "reconcile",
+			Schedule: workflow.Spec.Reconcile.Schedule,
 		})
 	}
 
@@ -141,7 +144,24 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"configmap", configMapName,
 			"updated", updated)
 
-		// If ConfigMap was updated, add to pending playbooks
+		// Reconcile CronJob if schedule is defined
+		if playbook.Schedule != "" {
+			if err := r.reconcileCronJob(ctx, workflow, configMapName, playbook); err != nil {
+				l.Error(err, "failed to reconcile CronJob")
+				return ctrl.Result{}, err
+			}
+			l.Info("Successfully reconciled CronJob",
+				"type", playbook.Type,
+				"schedule", playbook.Schedule)
+		} else {
+			// No schedule, clean up any existing CronJob
+			if err := r.deleteCronJobIfExists(ctx, workflow, playbook.Type); err != nil {
+				l.Error(err, "failed to delete CronJob")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// If ConfigMap was updated, add to pending playbooks for immediate execution
 		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
 			statusUpdated = true
@@ -173,8 +193,10 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
-	// No job running, process the first pending playbook (if any)
+	// No job running, process the pending playbook
 	if len(workflow.Status.PendingPlaybooks) > 0 {
+		sortPendingPlaybooks(workflow.Status.PendingPlaybooks)
+
 		pendingType := workflow.Status.PendingPlaybooks[0]
 		playbook, ok := playbookMap[pendingType]
 		if !ok {
@@ -241,6 +263,20 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// sortPendingPlaybooks ensures "apply" always comes before "reconcile"
+func sortPendingPlaybooks(playbooks []string) {
+	for i := 0; i < len(playbooks); i++ {
+		if playbooks[i] == "reconcile" {
+			for j := i + 1; j < len(playbooks); j++ {
+				if playbooks[j] == "apply" {
+					playbooks[i], playbooks[j] = playbooks[j], playbooks[i]
+					return
+				}
+			}
+		}
+	}
 }
 
 // isAnyJobRunning checks if any job for this workflow is currently running
@@ -369,7 +405,7 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 			},
 		},
 		Spec: batchv1.JobSpec{
-			TTLSecondsAfterFinished: ptr(int32(3600)),
+			TTLSecondsAfterFinished: ptr.To(int32(3600)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -423,9 +459,154 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 	return nil
 }
 
-// ptr returns a pointer to the given value
-func ptr[T any](v T) *T {
-	return &v
+// reconcileCronJob creates or updates a CronJob to run the Ansible playbook on schedule
+func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, configMapName string, playbook Playbook) error {
+	l := logf.FromContext(ctx)
+
+	cronJobName := fmt.Sprintf("%s-%s", workflow.Name, playbook.Type)
+	fileName := filepath.Base(playbook.Source.Path)
+
+	// Check if CronJob already exists
+	existingCronJob := &batchv1.CronJob{}
+	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: workflow.Namespace}, existingCronJob)
+
+	cronJobSpec := batchv1.CronJobSpec{
+		Schedule:          playbook.Schedule,
+		ConcurrencyPolicy: batchv1.ForbidConcurrent,
+		JobTemplate: batchv1.JobTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by":       "k8sible",
+					"app.kubernetes.io/k8sible-workflow": workflow.Name,
+					"app.kubernetes.io/k8sible-type":     playbook.Type,
+				},
+			},
+			Spec: batchv1.JobSpec{
+				TTLSecondsAfterFinished: ptr.To(int32(3600)),
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/managed-by":       "k8sible",
+							"app.kubernetes.io/k8sible-workflow": workflow.Name,
+							"app.kubernetes.io/k8sible-type":     playbook.Type,
+						},
+					},
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyNever,
+						Containers: []corev1.Container{
+							{
+								Name:    "ansible",
+								Image:   "quay.io/ansible/ansible-runner:latest",
+								Command: []string{"ansible-playbook"},
+								Args:    []string{"/playbook/" + fileName},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "playbook",
+										MountPath: "/playbook",
+									},
+								},
+							},
+						},
+						Volumes: []corev1.Volume{
+							{
+								Name: "playbook",
+								VolumeSource: corev1.VolumeSource{
+									ConfigMap: &corev1.ConfigMapVolumeSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: configMapName,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err == nil {
+		// CronJob exists, check if update is needed
+		if existingCronJob.Spec.Schedule == playbook.Schedule {
+			l.Info("CronJob unchanged, skipping update",
+				"cronjob", cronJobName,
+				"schedule", playbook.Schedule)
+			return nil
+		}
+
+		// Update the CronJob
+		l.Info("Updating CronJob",
+			"cronjob", cronJobName,
+			"oldSchedule", existingCronJob.Spec.Schedule,
+			"newSchedule", playbook.Schedule)
+
+		existingCronJob.Spec = cronJobSpec
+		if err := r.Update(ctx, existingCronJob); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// Create new CronJob
+	l.Info("Creating new CronJob",
+		"cronjob", cronJobName,
+		"schedule", playbook.Schedule)
+
+	cronJob := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cronJobName,
+			Namespace: workflow.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by":       "k8sible",
+				"app.kubernetes.io/k8sible-workflow": workflow.Name,
+				"app.kubernetes.io/k8sible-type":     playbook.Type,
+			},
+		},
+		Spec: cronJobSpec,
+	}
+
+	if err := controllerutil.SetControllerReference(workflow, cronJob, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, cronJob); err != nil {
+		return err
+	}
+
+	l.Info("CronJob created", "cronjob", cronJobName, "schedule", playbook.Schedule)
+	return nil
+}
+
+// deleteCronJobIfExists deletes a CronJob if it exists
+func (r *K8sibleWorkflowReconciler) deleteCronJobIfExists(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbookType string) error {
+	l := logf.FromContext(ctx)
+
+	cronJobName := fmt.Sprintf("%s-%s", workflow.Name, playbookType)
+
+	existingCronJob := &batchv1.CronJob{}
+	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: workflow.Namespace}, existingCronJob)
+
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	l.Info("Deleting CronJob (schedule removed)",
+		"cronjob", cronJobName)
+
+	if err := r.Delete(ctx, existingCronJob); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -434,6 +615,7 @@ func (r *K8sibleWorkflowReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&k8siblev1alpha1.K8sibleWorkflow{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&batchv1.Job{}).
+		Owns(&batchv1.CronJob{}).
 		Named("k8sibleworkflow").
 		Complete(r)
 }
