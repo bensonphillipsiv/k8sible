@@ -18,8 +18,8 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,6 +31,13 @@ type Source struct {
 	Repository string
 	Path       string
 	Reference  string
+}
+
+// CommitInfo contains information about a commit
+type CommitInfo struct {
+	SHA     string
+	Message string
+	Date    time.Time
 }
 
 // Client handles git operations
@@ -61,44 +68,64 @@ func NewClient(opts ...ClientOption) *Client {
 	return c
 }
 
-// FetchFile fetches a file directly from the repository's raw URL
-func (c *Client) FetchFile(ctx context.Context, source Source) (string, error) {
-	rawURL, err := buildRawFileURL(source.Repository, source.Path, source.Reference)
+// GetLatestCommit fetches the latest commit SHA for a specific path in the repository
+func (c *Client) GetLatestCommit(ctx context.Context, source Source) (*CommitInfo, error) {
+	apiURL, err := buildGitHubCommitAPIURL(source)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
+
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "k8sible-controller")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch file: %w", err)
+		return nil, fmt.Errorf("failed to fetch commit info: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to fetch file: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("failed to fetch commit info: HTTP %d", resp.StatusCode)
 	}
 
-	contents, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
+	var commits []struct {
+		SHA    string `json:"sha"`
+		Commit struct {
+			Message string `json:"message"`
+			Author  struct {
+				Date time.Time `json:"date"`
+			} `json:"author"`
+		} `json:"commit"`
 	}
 
-	return string(contents), nil
+	if err := json.NewDecoder(resp.Body).Decode(&commits); err != nil {
+		return nil, fmt.Errorf("failed to decode GitHub response: %w", err)
+	}
+
+	if len(commits) == 0 {
+		return nil, fmt.Errorf("no commits found for path")
+	}
+
+	return &CommitInfo{
+		SHA:     commits[0].SHA,
+		Message: commits[0].Commit.Message,
+		Date:    commits[0].Commit.Author.Date,
+	}, nil
 }
 
-// buildRawFileURL constructs the raw file URL based on the git provider
-func buildRawFileURL(repository, path, reference string) (string, error) {
-	parsed, err := url.Parse(repository)
+// buildGitHubCommitAPIURL constructs the GitHub API URL to fetch commit info for a path
+func buildGitHubCommitAPIURL(source Source) (string, error) {
+	parsed, err := url.Parse(source.Repository)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse repository URL: %w", err)
 	}
 
-	// Default reference to main if not specified
+	reference := source.Reference
 	if reference == "" {
 		reference = "main"
 	}
@@ -106,23 +133,7 @@ func buildRawFileURL(repository, path, reference string) (string, error) {
 	// Remove .git suffix if present
 	repoPath := strings.TrimSuffix(parsed.Path, ".git")
 
-	host := strings.ToLower(parsed.Host)
-
-	switch {
-	case strings.Contains(host, "github.com"):
-		// GitHub: https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}
-		return fmt.Sprintf("https://raw.githubusercontent.com%s/%s/%s", repoPath, reference, path), nil
-
-	case strings.Contains(host, "gitlab.com"):
-		// GitLab: https://gitlab.com/{owner}/{repo}/-/raw/{ref}/{path}
-		return fmt.Sprintf("https://gitlab.com%s/-/raw/%s/%s", repoPath, reference, path), nil
-
-	case strings.Contains(host, "bitbucket.org"):
-		// Bitbucket: https://bitbucket.org/{owner}/{repo}/raw/{ref}/{path}
-		return fmt.Sprintf("https://bitbucket.org%s/raw/%s/%s", repoPath, reference, path), nil
-
-	default:
-		// For self-hosted or unknown providers, try a generic GitLab-style URL
-		return fmt.Sprintf("%s://%s%s/-/raw/%s/%s", parsed.Scheme, parsed.Host, repoPath, reference, path), nil
-	}
+	// GitHub API: GET /repos/{owner}/{repo}/commits?path={path}&sha={ref}&per_page=1
+	return fmt.Sprintf("https://api.github.com/repos%s/commits?path=%s&sha=%s&per_page=1",
+		repoPath, url.QueryEscape(source.Path), url.QueryEscape(reference)), nil
 }

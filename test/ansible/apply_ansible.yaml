@@ -7,7 +7,7 @@
   tasks:
     - name: Print hello message
       ansible.builtin.debug:
-        msg: "Hello from apply K8sible!"
+        msg: "Hello from apply K8sible! - testing change"
 
     - name: Print current date
       ansible.builtin.debug:

@@ -18,10 +18,7 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -37,10 +34,6 @@ import (
 
 	k8siblev1alpha1 "github.com/bensonphillipsiv/k8sible.git/api/v1alpha1"
 	"github.com/bensonphillipsiv/k8sible.git/internal/git"
-)
-
-const (
-	contentHashAnnotation = "k8sible.io/content-hash"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
@@ -86,7 +79,7 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"pendingPlaybooks", workflow.Status.PendingPlaybooks,
 	)
 
-	// Build list of playbooks to fetch
+	// Build list of playbooks to check
 	playbooks := []Playbook{
 		{
 			Source: git.Source{
@@ -120,33 +113,34 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// Track if status needs updating
 	statusUpdated := false
 
-	// Process all playbooks - reconcile ConfigMaps and track pending jobs
+	// Process all playbooks - check commits and track pending jobs
 	for _, playbook := range playbooks {
-		contents, err := r.GitClient.FetchFile(ctx, playbook.Source)
+		commitInfo, err := r.GitClient.GetLatestCommit(ctx, playbook.Source)
 		if err != nil {
-			l.Error(err, "failed to fetch file from source",
+			l.Error(err, "failed to get latest commit",
 				"type", playbook.Type,
 				"path", playbook.Source.Path)
 			return ctrl.Result{}, err
 		}
-		l.Info("Fetched file contents",
+		l.Info("Got latest commit",
 			"type", playbook.Type,
 			"path", playbook.Source.Path,
-			"contentLength", len(contents))
+			"sha", commitInfo.SHA,
+			"date", commitInfo.Date)
 
-		// Reconcile the ConfigMap
-		configMapName, updated, err := r.reconcileConfigMap(ctx, workflow, contents, playbook)
+		// Reconcile the commit tracking ConfigMap
+		configMapName, updated, err := r.reconcileConfigMap(ctx, workflow, commitInfo, playbook)
 		if err != nil {
-			l.Error(err, "failed to reconcile ConfigMap")
+			l.Error(err, "failed to reconcile commit ConfigMap")
 			return ctrl.Result{}, err
 		}
-		l.Info("Successfully reconciled ConfigMap",
+		l.Info("Reconciled commit tracking ConfigMap",
 			"configmap", configMapName,
 			"updated", updated)
 
 		// Reconcile CronJob if schedule is defined
 		if playbook.Schedule != "" {
-			if err := r.reconcileCronJob(ctx, workflow, configMapName, playbook); err != nil {
+			if err := r.reconcileCronJob(ctx, workflow, playbook); err != nil {
 				l.Error(err, "failed to reconcile CronJob")
 				return ctrl.Result{}, err
 			}
@@ -161,12 +155,13 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			}
 		}
 
-		// If ConfigMap was updated, add to pending playbooks for immediate execution
+		// If commit changed, add to pending playbooks for immediate execution
 		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
 			statusUpdated = true
-			l.Info("Added playbook to pending queue",
+			l.Info("Added playbook to pending queue (new commit detected)",
 				"type", playbook.Type,
+				"commit", commitInfo.SHA,
 				"pendingPlaybooks", workflow.Status.PendingPlaybooks)
 		}
 	}
@@ -182,7 +177,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		l.Info("A job is still running, will requeue to process pending jobs later",
 			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
 
-		// Update status if needed before returning
 		if statusUpdated {
 			if err := r.Status().Update(ctx, workflow); err != nil {
 				l.Error(err, "failed to update workflow status")
@@ -202,7 +196,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if !ok {
 			l.Error(nil, "pending playbook type not found in playbook map",
 				"type", pendingType)
-			// Remove invalid entry from pending list
 			workflow.Status.PendingPlaybooks = workflow.Status.PendingPlaybooks[1:]
 			if err := r.Status().Update(ctx, workflow); err != nil {
 				l.Error(err, "failed to update workflow status")
@@ -211,18 +204,15 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return ctrl.Result{Requeue: true}, nil
 		}
 
-		configMapName := workflow.Name + "-" + playbook.Type
-
-		// Create the job
-		if err := r.reconcileJob(ctx, workflow, configMapName, playbook); err != nil {
+		if err := r.reconcileJob(ctx, workflow, playbook); err != nil {
 			l.Error(err, "failed to reconcile Job")
 			return ctrl.Result{}, err
 		}
-		l.Info("Successfully created Job",
+		l.Info("Successfully created ansible-pull Job",
 			"type", playbook.Type,
-			"configmap", configMapName)
+			"repo", playbook.Source.Repository,
+			"path", playbook.Source.Path)
 
-		// Remove from pending list
 		workflow.Status.PendingPlaybooks = workflow.Status.PendingPlaybooks[1:]
 		statusUpdated = true
 
@@ -231,7 +221,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"remainingPending", workflow.Status.PendingPlaybooks)
 	}
 
-	// Update status if needed
 	if statusUpdated {
 		if err := r.Status().Update(ctx, workflow); err != nil {
 			l.Error(err, "failed to update workflow status")
@@ -239,7 +228,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Requeue sooner if there are still pending playbooks
 	if len(workflow.Status.PendingPlaybooks) > 0 {
 		l.Info("More playbooks pending, will requeue to check job status",
 			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
@@ -249,13 +237,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{RequeueAfter: time.Minute * 3}, nil
 }
 
-// computeHash generates a SHA256 hash of the content
-func computeHash(content string) string {
-	hash := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(hash[:])
-}
-
-// contains checks if a string slice contains a specific string
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
@@ -265,7 +246,6 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// sortPendingPlaybooks ensures "apply" always comes before "reconcile"
 func sortPendingPlaybooks(playbooks []string) {
 	for i := 0; i < len(playbooks); i++ {
 		if playbooks[i] == "reconcile" {
@@ -279,7 +259,6 @@ func sortPendingPlaybooks(playbooks []string) {
 	}
 }
 
-// isAnyJobRunning checks if any job for this workflow is currently running
 func (r *K8sibleWorkflowReconciler) isAnyJobRunning(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) (bool, error) {
 	jobList := &batchv1.JobList{}
 	if err := r.List(ctx, jobList,
@@ -302,42 +281,33 @@ func (r *K8sibleWorkflowReconciler) isAnyJobRunning(ctx context.Context, workflo
 	return false, nil
 }
 
-// reconcileConfigMap creates or updates a ConfigMap with the workflow file contents
-// Returns configMapName, whether it was updated, and any error
-func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, contents string, playbook Playbook) (string, bool, error) {
+func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, commitInfo *git.CommitInfo, playbook Playbook) (string, bool, error) {
 	l := logf.FromContext(ctx)
-	configMapName := workflow.Name + "-" + playbook.Type
-	fileName := filepath.Base(playbook.Source.Path)
-	contentHash := computeHash(contents)
+	configMapName := workflow.Name + "-" + playbook.Type + "-commit"
 
-	// Check if ConfigMap already exists
 	existingConfigMap := &corev1.ConfigMap{}
 	err := r.Get(ctx, client.ObjectKey{Name: configMapName, Namespace: workflow.Namespace}, existingConfigMap)
 
 	if err == nil {
-		// ConfigMap exists, check if hash matches
-		existingHash := existingConfigMap.Annotations[contentHashAnnotation]
-		if existingHash == contentHash {
-			l.Info("ConfigMap content unchanged, skipping update",
+		existingCommit := existingConfigMap.Data["commit"]
+		if existingCommit == commitInfo.SHA {
+			l.Info("Commit unchanged, skipping update",
 				"configmap", configMapName,
-				"hash", contentHash)
+				"commit", commitInfo.SHA)
 			return configMapName, false, nil
 		}
 
-		// Hash doesn't match, update the ConfigMap
-		l.Info("ConfigMap content changed, updating",
+		l.Info("New commit detected, updating",
 			"configmap", configMapName,
-			"oldHash", existingHash,
-			"newHash", contentHash)
+			"oldCommit", existingCommit,
+			"newCommit", commitInfo.SHA)
 
 		existingConfigMap.Data = map[string]string{
-			fileName: contents,
+			"commit":  commitInfo.SHA,
+			"date":    commitInfo.Date.Format(time.RFC3339),
+			"message": commitInfo.Message,
+			"path":    playbook.Source.Path,
 		}
-
-		if existingConfigMap.Annotations == nil {
-			existingConfigMap.Annotations = make(map[string]string)
-		}
-		existingConfigMap.Annotations[contentHashAnnotation] = contentHash
 
 		if err := r.Update(ctx, existingConfigMap); err != nil {
 			return "", false, err
@@ -350,10 +320,9 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 		return "", false, err
 	}
 
-	// ConfigMap doesn't exist, create it
-	l.Info("Creating new ConfigMap",
+	l.Info("Creating new commit tracking ConfigMap",
 		"configmap", configMapName,
-		"hash", contentHash)
+		"commit", commitInfo.SHA)
 
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -364,16 +333,15 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 				"app.kubernetes.io/name":         workflow.Name,
 				"app.kubernetes.io/k8sible-type": playbook.Type,
 			},
-			Annotations: map[string]string{
-				contentHashAnnotation: contentHash,
-			},
 		},
 		Data: map[string]string{
-			fileName: contents,
+			"commit":  commitInfo.SHA,
+			"date":    commitInfo.Date.Format(time.RFC3339),
+			"message": commitInfo.Message,
+			"path":    playbook.Source.Path,
 		},
 	}
 
-	// Set owner reference
 	if err := controllerutil.SetControllerReference(workflow, configMap, r.Scheme); err != nil {
 		return "", false, err
 	}
@@ -385,15 +353,27 @@ func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, work
 	return configMapName, true, nil
 }
 
-// reconcileJob creates a Job to run the Ansible playbook
-func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, configMapName string, playbook Playbook) error {
+func buildAnsiblePullArgs(source git.Source) []string {
+	args := []string{
+		"-U", source.Repository,
+	}
+
+	if source.Reference != "" {
+		args = append(args, "-C", source.Reference)
+	}
+
+	args = append(args, source.Path)
+
+	return args
+}
+
+func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbook Playbook) error {
 	l := logf.FromContext(ctx)
 
-	// Generate unique job name with timestamp
 	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
-	fileName := filepath.Base(playbook.Source.Path)
+	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source)
 
-	l.Info("Creating new Job", "job", jobName, "type", playbook.Type)
+	l.Info("Creating new ansible-pull Job", "job", jobName, "type", playbook.Type)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -421,26 +401,8 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 						{
 							Name:    "ansible",
 							Image:   "quay.io/ansible/ansible-runner:latest",
-							Command: []string{"ansible-playbook"},
-							Args:    []string{"/playbook/" + fileName},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "playbook",
-									MountPath: "/playbook",
-								},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "playbook",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: configMapName,
-									},
-								},
-							},
+							Command: []string{"ansible-pull"},
+							Args:    ansiblePullArgs,
 						},
 					},
 				},
@@ -456,18 +418,16 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 		return err
 	}
 
-	l.Info("Job created", "job", jobName)
+	l.Info("Job created", "job", jobName, "args", ansiblePullArgs)
 	return nil
 }
 
-// reconcileCronJob creates or updates a CronJob to run the Ansible playbook on schedule
-func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, configMapName string, playbook Playbook) error {
+func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbook Playbook) error {
 	l := logf.FromContext(ctx)
 
 	cronJobName := fmt.Sprintf("%s-%s", workflow.Name, playbook.Type)
-	fileName := filepath.Base(playbook.Source.Path)
+	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source)
 
-	// Check if CronJob already exists
 	existingCronJob := &batchv1.CronJob{}
 	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: workflow.Namespace}, existingCronJob)
 
@@ -498,26 +458,8 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 							{
 								Name:    "ansible",
 								Image:   "quay.io/ansible/ansible-runner:latest",
-								Command: []string{"ansible-playbook"},
-								Args:    []string{"/playbook/" + fileName},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "playbook",
-										MountPath: "/playbook",
-									},
-								},
-							},
-						},
-						Volumes: []corev1.Volume{
-							{
-								Name: "playbook",
-								VolumeSource: corev1.VolumeSource{
-									ConfigMap: &corev1.ConfigMapVolumeSource{
-										LocalObjectReference: corev1.LocalObjectReference{
-											Name: configMapName,
-										},
-									},
-								},
+								Command: []string{"ansible-pull"},
+								Args:    ansiblePullArgs,
 							},
 						},
 					},
@@ -527,7 +469,6 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 	}
 
 	if err == nil {
-		// CronJob exists, check if update is needed
 		if existingCronJob.Spec.Schedule == playbook.Schedule {
 			l.Info("CronJob unchanged, skipping update",
 				"cronjob", cronJobName,
@@ -535,25 +476,19 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 			return nil
 		}
 
-		// Update the CronJob
 		l.Info("Updating CronJob",
 			"cronjob", cronJobName,
 			"oldSchedule", existingCronJob.Spec.Schedule,
 			"newSchedule", playbook.Schedule)
 
 		existingCronJob.Spec = cronJobSpec
-		if err := r.Update(ctx, existingCronJob); err != nil {
-			return err
-		}
-
-		return nil
+		return r.Update(ctx, existingCronJob)
 	}
 
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
 
-	// Create new CronJob
 	l.Info("Creating new CronJob",
 		"cronjob", cronJobName,
 		"schedule", playbook.Schedule)
@@ -583,7 +518,6 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 	return nil
 }
 
-// deleteCronJobIfExists deletes a CronJob if it exists
 func (r *K8sibleWorkflowReconciler) deleteCronJobIfExists(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbookType string) error {
 	l := logf.FromContext(ctx)
 
@@ -600,17 +534,10 @@ func (r *K8sibleWorkflowReconciler) deleteCronJobIfExists(ctx context.Context, w
 		return err
 	}
 
-	l.Info("Deleting CronJob (schedule removed)",
-		"cronjob", cronJobName)
-
-	if err := r.Delete(ctx, existingCronJob); err != nil {
-		return err
-	}
-
-	return nil
+	l.Info("Deleting CronJob (schedule removed)", "cronjob", cronJobName)
+	return r.Delete(ctx, existingCronJob)
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *K8sibleWorkflowReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k8siblev1alpha1.K8sibleWorkflow{}).
