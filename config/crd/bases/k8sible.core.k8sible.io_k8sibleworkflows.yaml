@@ -131,6 +131,15 @@ spec:
           status:
             description: K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
             properties:
+              applyScheduleStatus:
+                description: ApplyScheduleStatus tracks the apply playbook schedule
+                properties:
+                  lastScheduledTime:
+                    description: LastScheduledTime is when the playbook was last scheduled
+                      to run
+                    format: date-time
+                    type: string
+                type: object
               conditions:
                 description: Conditions represent the current state of the K8sibleWorkflow
                   resource.
@@ -250,6 +259,16 @@ spec:
                 items:
                   type: string
                 type: array
+              reconcileScheduleStatus:
+                description: ReconcileScheduleStatus tracks the reconcile playbook
+                  schedule
+                properties:
+                  lastScheduledTime:
+                    description: LastScheduledTime is when the playbook was last scheduled
+                      to run
+                    format: date-time
+                    type: string
+                type: object
             type: object
         required:
         - spec
