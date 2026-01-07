@@ -53,11 +53,19 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of K8sibleWorkflow
+            description: K8sibleWorkflowSpec defines the desired state of K8sibleWorkflow
             properties:
               apply:
                 description: Apply defines the apply playbook configuration
                 properties:
+                  maxRetries:
+                    default: 3
+                    description: MaxRetries is the maximum number of retry attempts
+                      for failed jobs
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
                   path:
                     description: Path is the path to the playbook file in the repository
                     type: string
@@ -68,16 +76,17 @@ spec:
                 required:
                 - path
                 type: object
-              maxRetries:
-                default: 3
-                description: MaxRetries is the maximum number of retry attempts for
-                  failed jobs
-                maximum: 10
-                minimum: 0
-                type: integer
               reconcile:
                 description: Reconcile defines the optional reconcile playbook configuration
                 properties:
+                  maxRetries:
+                    default: 3
+                    description: MaxRetries is the maximum number of retry attempts
+                      for failed jobs
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
                   path:
                     description: Path is the path to the playbook file in the repository
                     type: string
@@ -92,9 +101,26 @@ spec:
                 description: Source defines the git repository source
                 properties:
                   reference:
+                    description: Reference is the git reference (branch, tag, or commit)
                     type: string
                   repository:
+                    description: Repository is the URL of the git repository
                     type: string
+                  secretRef:
+                    description: SecretRef references a secret containing the git
+                      credentials
+                    properties:
+                      key:
+                        default: token
+                        description: Key is the key in the secret containing the token
+                          (defaults to "token")
+                        type: string
+                      name:
+                        description: Name is the name of the secret
+                        type: string
+                    required:
+                    - name
+                    type: object
                 required:
                 - repository
                 type: object
@@ -103,7 +129,7 @@ spec:
             - source
             type: object
           status:
-            description: status defines the observed state of K8sibleWorkflow
+            description: K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
             properties:
               conditions:
                 description: Conditions represent the current state of the K8sibleWorkflow
@@ -170,9 +196,6 @@ spec:
                 description: LastFailedRun contains information about the last failed
                   playbook run
                 properties:
-                  changed:
-                    description: Changed indicates if the playbook made changes
-                    type: boolean
                   endTime:
                     description: EndTime is when the job ended
                     format: date-time
@@ -199,9 +222,6 @@ spec:
                 description: LastSuccessfulRun contains information about the last
                   successful playbook run
                 properties:
-                  changed:
-                    description: Changed indicates if the playbook made changes
-                    type: boolean
                   endTime:
                     description: EndTime is when the job ended
                     format: date-time
@@ -230,12 +250,6 @@ spec:
                 items:
                   type: string
                 type: array
-              retryCount:
-                additionalProperties:
-                  type: integer
-                description: RetryCount tracks the number of retries for each playbook
-                  type
-                type: object
             type: object
         required:
         - spec

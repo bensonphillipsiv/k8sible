@@ -9,9 +9,13 @@ spec:
   source:
     repository: https://github.com/bensonphillipsiv/k8sible
     reference: main
+    secretRef:
+      name: k8sible-git-credentials
   apply:
     path: test/ansible/apply_ansible.yaml
     schedule: "0 2 * * *"
+    maxRetries: 3
   reconcile:
     path: test/ansible/reconcile_ansible.yaml
     schedule: "0 3 * * *"
+    maxRetries: 3

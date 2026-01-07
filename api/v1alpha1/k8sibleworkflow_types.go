@@ -20,11 +20,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NOTE: json tags are required. Any new fields you add must have json tags for the fields to be serialized.
+// SecretRef references a Kubernetes secret
+type SecretRef struct {
+	// Name is the name of the secret
+	Name string `json:"name"`
 
+	// Key is the key in the secret containing the token (defaults to "token")
+	// +optional
+	// +kubebuilder:default=token
+	Key string `json:"key,omitempty"`
+}
+
+// SourceSpec defines the git repository source
 type SourceSpec struct {
+	// Repository is the URL of the git repository
 	Repository string `json:"repository"`
-	Reference  string `json:"reference,omitempty"`
+
+	// Reference is the git reference (branch, tag, or commit)
+	// +optional
+	Reference string `json:"reference,omitempty"`
+
+	// SecretRef references a secret containing the git credentials
+	// +optional
+	SecretRef *SecretRef `json:"secretRef,omitempty"`
 }
 
 // PlaybookSpec defines a playbook configuration
@@ -35,6 +53,13 @@ type PlaybookSpec struct {
 	// Schedule is an optional cron schedule for running the playbook
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
+
+	// MaxRetries is the maximum number of retry attempts for failed jobs
+	// +optional
+	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	MaxRetries *int32 `json:"maxRetries,omitempty"`
 }
 
 // K8sibleWorkflowSpec defines the desired state of K8sibleWorkflow
@@ -48,13 +73,6 @@ type K8sibleWorkflowSpec struct {
 	// Reconcile defines the optional reconcile playbook configuration
 	// +optional
 	Reconcile *PlaybookSpec `json:"reconcile,omitempty"`
-
-	// MaxRetries is the maximum number of retry attempts for failed jobs
-	// +optional
-	// +kubebuilder:default=3
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=10
-	MaxRetries int `json:"maxRetries,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run
@@ -73,10 +91,6 @@ type PlaybookRunStatus struct {
 	// Succeeded indicates if the job succeeded
 	Succeeded bool `json:"succeeded"`
 
-	// Changed indicates if the playbook made changes
-	// +optional
-	Changed bool `json:"changed,omitempty"`
-
 	// Message contains additional information about the run
 	// +optional
 	Message string `json:"message,omitempty"`
@@ -87,10 +101,6 @@ type K8sibleWorkflowStatus struct {
 	// PendingPlaybooks is a list of playbook types waiting to be executed
 	// +optional
 	PendingPlaybooks []string `json:"pendingPlaybooks,omitempty"`
-
-	// RetryCount tracks the number of retries for each playbook type
-	// +optional
-	RetryCount map[string]int `json:"retryCount,omitempty"`
 
 	// LastSuccessfulRun contains information about the last successful playbook run
 	// +optional
@@ -119,15 +129,12 @@ type K8sibleWorkflowStatus struct {
 type K8sibleWorkflow struct {
 	metav1.TypeMeta `json:",inline"`
 
-	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`
 
-	// spec defines the desired state of K8sibleWorkflow
 	// +required
 	Spec K8sibleWorkflowSpec `json:"spec"`
 
-	// status defines the observed state of K8sibleWorkflow
 	// +optional
 	Status K8sibleWorkflowStatus `json:"status,omitzero"`
 }

@@ -38,37 +38,36 @@ import (
 )
 
 const (
-	DefaultMaxRetries = 3
+	DefaultMaxRetries int32 = 3
 
 	// Event reasons
-	EventReasonJobStarted        = "JobStarted"
-	EventReasonJobSucceeded      = "JobSucceeded"
-	EventReasonJobFailed         = "JobFailed"
-	EventReasonJobRetry          = "JobRetry"
-	EventReasonMaxRetriesReached = "MaxRetriesReached"
-	EventReasonReconcileTrigger  = "ReconcileTriggeredApply"
+	EventReasonJobStarted       = "JobStarted"
+	EventReasonJobSucceeded     = "JobSucceeded"
+	EventReasonJobFailed        = "JobFailed"
+	EventReasonReconcileTrigger = "ReconcileTriggeredApply"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
 type K8sibleWorkflowReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GitClient  *git.Client
-	Recorder   record.EventRecorder
-	MaxRetries int
+	Scheme    *runtime.Scheme
+	GitClient *git.Client
+	Recorder  record.EventRecorder
 }
 
 // Playbook represents a playbook source and its type
 type Playbook struct {
-	Source   git.Source
-	Type     string // "apply" or "reconcile"
-	Schedule string // cron schedule (optional)
+	Source     git.Source
+	Type       string // "apply" or "reconcile"
+	Schedule   string // cron schedule (optional)
+	MaxRetries int32
 }
 
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
@@ -84,11 +83,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Initialize status if needed
-	if workflow.Status.RetryCount == nil {
-		workflow.Status.RetryCount = make(map[string]int)
-	}
-
 	l.Info("K8sibleWorkflow",
 		"name", workflow.Name,
 		"repo", workflow.Spec.Source.Repository,
@@ -96,8 +90,14 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"applyPath", workflow.Spec.Apply.Path,
 		"applySchedule", workflow.Spec.Apply.Schedule,
 		"pendingPlaybooks", workflow.Status.PendingPlaybooks,
-		"retryCount", workflow.Status.RetryCount,
 	)
+
+	// Get git token from secret if configured
+	gitToken, err := r.getGitToken(ctx, workflow)
+	if err != nil {
+		l.Error(err, "failed to get git token from secret")
+		return ctrl.Result{}, err
+	}
 
 	// Build list of playbooks to check
 	playbooks := []Playbook{
@@ -107,8 +107,9 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Apply.Path,
 			},
-			Type:     "apply",
-			Schedule: workflow.Spec.Apply.Schedule,
+			Type:       "apply",
+			Schedule:   workflow.Spec.Apply.Schedule,
+			MaxRetries: getMaxRetries(workflow.Spec.Apply.MaxRetries),
 		},
 	}
 
@@ -119,8 +120,9 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Reconcile.Path,
 			},
-			Type:     "reconcile",
-			Schedule: workflow.Spec.Reconcile.Schedule,
+			Type:       "reconcile",
+			Schedule:   workflow.Spec.Reconcile.Schedule,
+			MaxRetries: getMaxRetries(workflow.Spec.Reconcile.MaxRetries),
 		})
 	}
 
@@ -150,7 +152,7 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// Process all playbooks - check commits and track pending jobs
 	for _, playbook := range playbooks {
-		commitInfo, err := r.GitClient.GetLatestCommit(ctx, playbook.Source)
+		commitInfo, err := r.GitClient.GetLatestCommit(ctx, playbook.Source, gitToken)
 		if err != nil {
 			l.Error(err, "failed to get latest commit",
 				"type", playbook.Type,
@@ -193,8 +195,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// If commit changed, add to pending playbooks for immediate execution
 		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
-			// Reset retry count for new commits
-			workflow.Status.RetryCount[playbook.Type] = 0
 			statusUpdated = true
 			l.Info("Added playbook to pending queue (new commit detected)",
 				"type", playbook.Type,
@@ -247,12 +247,13 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 
 		r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonJobStarted,
-			"Started %s job for playbook %s", playbook.Type, playbook.Source.Path)
+			"Started %s job for playbook %s (maxRetries: %d)", playbook.Type, playbook.Source.Path, playbook.MaxRetries)
 
 		l.Info("Successfully created ansible-pull Job",
 			"type", playbook.Type,
 			"repo", playbook.Source.Repository,
-			"path", playbook.Source.Path)
+			"path", playbook.Source.Path,
+			"maxRetries", playbook.MaxRetries)
 
 		workflow.Status.PendingPlaybooks = workflow.Status.PendingPlaybooks[1:]
 		statusUpdated = true
@@ -276,6 +277,41 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	return ctrl.Result{RequeueAfter: time.Minute * 3}, nil
+}
+
+// getGitToken retrieves the git token from the referenced secret
+func (r *K8sibleWorkflowReconciler) getGitToken(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) (string, error) {
+	if workflow.Spec.Source.SecretRef == nil {
+		return "", nil
+	}
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{
+		Name:      workflow.Spec.Source.SecretRef.Name,
+		Namespace: workflow.Namespace,
+	}, secret); err != nil {
+		return "", fmt.Errorf("failed to get secret %s: %w", workflow.Spec.Source.SecretRef.Name, err)
+	}
+
+	key := workflow.Spec.Source.SecretRef.Key
+	if key == "" {
+		key = "token"
+	}
+
+	token, ok := secret.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %s not found in secret %s", key, workflow.Spec.Source.SecretRef.Name)
+	}
+
+	return string(token), nil
+}
+
+// getMaxRetries returns the max retries value or the default
+func getMaxRetries(maxRetries *int32) int32 {
+	if maxRetries == nil {
+		return DefaultMaxRetries
+	}
+	return *maxRetries
 }
 
 func (r *K8sibleWorkflowReconciler) checkCompletedJobs(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) (*batchv1.Job, bool, error) {
@@ -322,10 +358,6 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 	l := logf.FromContext(ctx)
 
 	playbookType := job.Labels["app.kubernetes.io/k8sible-type"]
-	maxRetries := r.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
 
 	// Mark job as processed
 	if job.Annotations == nil {
@@ -338,9 +370,6 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 
 	if succeeded {
 		l.Info("Job succeeded", "job", job.Name, "type", playbookType)
-
-		// Reset retry count on success
-		workflow.Status.RetryCount[playbookType] = 0
 
 		// Update last successful run
 		now := metav1.Now()
@@ -357,12 +386,7 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		return nil
 	}
 
-	// Job failed
-	currentRetries := workflow.Status.RetryCount[playbookType]
-	currentRetries++
-	workflow.Status.RetryCount[playbookType] = currentRetries
-
-	// Get failure message from job conditions
+	// Job failed (after all retries via BackoffLimit)
 	var failureMessage string
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed {
@@ -371,11 +395,9 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		}
 	}
 
-	l.Info("Job failed",
+	l.Info("Job failed after all retries",
 		"job", job.Name,
 		"type", playbookType,
-		"retryCount", currentRetries,
-		"maxRetries", maxRetries,
 		"message", failureMessage)
 
 	// Update last failed run
@@ -388,40 +410,13 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		Message:   failureMessage,
 	}
 
-	if currentRetries < maxRetries {
-		// Retry the job
-		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobRetry,
-			"Job %s failed, scheduling retry %d/%d: %s",
-			job.Name, currentRetries, maxRetries, failureMessage)
+	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
+		"Job %s failed after all retries: %s", job.Name, failureMessage)
 
-		// Add back to pending queue for retry
-		if !contains(workflow.Status.PendingPlaybooks, playbookType) {
-			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbookType)
-		}
-
-		return nil
-	}
-
-	// Max retries reached
-	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonMaxRetriesReached,
-		"Job %s failed after %d retries: %s",
-		job.Name, maxRetries, failureMessage)
-
-	if playbookType == "apply" {
-		// Apply job failed after max retries - just record the event
-		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
-			"Apply job failed after %d retries. Manual intervention may be required.", maxRetries)
-
-		// Reset retry count
-		workflow.Status.RetryCount[playbookType] = 0
-
-	} else if playbookType == "reconcile" {
+	if playbookType == "reconcile" {
 		// Reconcile job failed after max retries - trigger apply
 		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonReconcileTrigger,
-			"Reconcile job failed after %d retries, triggering apply job", maxRetries)
-
-		// Reset reconcile retry count
-		workflow.Status.RetryCount["reconcile"] = 0
+			"Reconcile job failed, triggering apply job")
 
 		// Queue apply followed by reconcile
 		workflow.Status.PendingPlaybooks = []string{}
@@ -473,10 +468,29 @@ func (r *K8sibleWorkflowReconciler) isAnyJobRunning(ctx context.Context, workflo
 	}
 
 	for _, job := range jobList.Items {
+		// Check if job is active or still has retries pending
 		if job.Status.Active > 0 {
 			logf.FromContext(ctx).Info("Found running job",
 				"job", job.Name,
 				"active", job.Status.Active)
+			return true, nil
+		}
+
+		// Also check if job hasn't reached a terminal condition yet
+		hasTerminalCondition := false
+		for _, condition := range job.Status.Conditions {
+			if (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed) &&
+				condition.Status == corev1.ConditionTrue {
+				hasTerminalCondition = true
+				break
+			}
+		}
+
+		// If job exists but hasn't completed or failed, it might be retrying
+		if !hasTerminalCondition && job.Annotations["k8sible.io/processed"] != "true" {
+			logf.FromContext(ctx).Info("Found job pending retry",
+				"job", job.Name,
+				"failed", job.Status.Failed)
 			return true, nil
 		}
 	}
@@ -576,7 +590,7 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
 	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source)
 
-	l.Info("Creating new ansible-pull Job", "job", jobName, "type", playbook.Type)
+	l.Info("Creating new ansible-pull Job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -589,6 +603,7 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 			},
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit:            ptr.To(playbook.MaxRetries),
 			TTLSecondsAfterFinished: ptr.To(int32(3600)),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -621,7 +636,7 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 		return err
 	}
 
-	l.Info("Job created", "job", jobName, "args", ansiblePullArgs)
+	l.Info("Job created", "job", jobName, "args", ansiblePullArgs, "backoffLimit", playbook.MaxRetries)
 	return nil
 }
 
@@ -646,6 +661,7 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 				},
 			},
 			Spec: batchv1.JobSpec{
+				BackoffLimit:            ptr.To(playbook.MaxRetries),
 				TTLSecondsAfterFinished: ptr.To(int32(3600)),
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
@@ -672,7 +688,8 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 	}
 
 	if err == nil {
-		if existingCronJob.Spec.Schedule == playbook.Schedule {
+		if existingCronJob.Spec.Schedule == playbook.Schedule &&
+			*existingCronJob.Spec.JobTemplate.Spec.BackoffLimit == playbook.MaxRetries {
 			l.Info("CronJob unchanged, skipping update",
 				"cronjob", cronJobName,
 				"schedule", playbook.Schedule)
@@ -694,7 +711,8 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 
 	l.Info("Creating new CronJob",
 		"cronjob", cronJobName,
-		"schedule", playbook.Schedule)
+		"schedule", playbook.Schedule,
+		"backoffLimit", playbook.MaxRetries)
 
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -717,7 +735,7 @@ func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workfl
 		return err
 	}
 
-	l.Info("CronJob created", "cronjob", cronJobName, "schedule", playbook.Schedule)
+	l.Info("CronJob created", "cronjob", cronJobName, "schedule", playbook.Schedule, "backoffLimit", playbook.MaxRetries)
 	return nil
 }
 

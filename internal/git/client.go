@@ -69,7 +69,7 @@ func NewClient(opts ...ClientOption) *Client {
 }
 
 // GetLatestCommit fetches the latest commit SHA for a specific path in the repository
-func (c *Client) GetLatestCommit(ctx context.Context, source Source) (*CommitInfo, error) {
+func (c *Client) GetLatestCommit(ctx context.Context, source Source, token string) (*CommitInfo, error) {
 	apiURL, err := buildGitHubCommitAPIURL(source)
 	if err != nil {
 		return nil, err
@@ -82,6 +82,10 @@ func (c *Client) GetLatestCommit(ctx context.Context, source Source) (*CommitInf
 
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "k8sible-controller")
+
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
