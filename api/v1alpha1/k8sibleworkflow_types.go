@@ -96,6 +96,13 @@ type PlaybookRunStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
+// ScheduleStatus tracks the last scheduled run time for a playbook
+type ScheduleStatus struct {
+	// LastScheduledTime is when the playbook was last scheduled to run
+	// +optional
+	LastScheduledTime *metav1.Time `json:"lastScheduledTime,omitempty"`
+}
+
 // K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
 type K8sibleWorkflowStatus struct {
 	// PendingPlaybooks is a list of playbook types waiting to be executed
@@ -109,6 +116,14 @@ type K8sibleWorkflowStatus struct {
 	// LastFailedRun contains information about the last failed playbook run
 	// +optional
 	LastFailedRun *PlaybookRunStatus `json:"lastFailedRun,omitempty"`
+
+	// ApplyScheduleStatus tracks the apply playbook schedule
+	// +optional
+	ApplyScheduleStatus *ScheduleStatus `json:"applyScheduleStatus,omitempty"`
+
+	// ReconcileScheduleStatus tracks the reconcile playbook schedule
+	// +optional
+	ReconcileScheduleStatus *ScheduleStatus `json:"reconcileScheduleStatus,omitempty"`
 
 	// Conditions represent the current state of the K8sibleWorkflow resource.
 	// +listType=map

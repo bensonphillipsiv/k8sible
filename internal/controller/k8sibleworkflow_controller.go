@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -45,6 +46,7 @@ const (
 	EventReasonJobSucceeded     = "JobSucceeded"
 	EventReasonJobFailed        = "JobFailed"
 	EventReasonReconcileTrigger = "ReconcileTriggeredApply"
+	EventReasonScheduledRun     = "ScheduledRun"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
@@ -70,7 +72,6 @@ type Playbook struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -175,23 +176,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"configmap", configMapName,
 			"updated", updated)
 
-		// Reconcile CronJob if schedule is defined
-		if playbook.Schedule != "" {
-			if err := r.reconcileCronJob(ctx, workflow, playbook); err != nil {
-				l.Error(err, "failed to reconcile CronJob")
-				return ctrl.Result{}, err
-			}
-			l.Info("Successfully reconciled CronJob",
-				"type", playbook.Type,
-				"schedule", playbook.Schedule)
-		} else {
-			// No schedule, clean up any existing CronJob
-			if err := r.deleteCronJobIfExists(ctx, workflow, playbook.Type); err != nil {
-				l.Error(err, "failed to delete CronJob")
-				return ctrl.Result{}, err
-			}
-		}
-
 		// If commit changed, add to pending playbooks for immediate execution
 		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
@@ -200,6 +184,42 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				"type", playbook.Type,
 				"commit", commitInfo.SHA,
 				"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+		}
+
+		// Check if scheduled run is due
+		if playbook.Schedule != "" {
+			shouldRun, err := r.isScheduledRunDue(workflow, playbook)
+			if err != nil {
+				l.Error(err, "failed to check schedule",
+					"type", playbook.Type,
+					"schedule", playbook.Schedule)
+				// Don't fail the reconcile, just skip scheduling
+			} else if shouldRun && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
+				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
+				statusUpdated = true
+
+				// Update last scheduled time
+				now := metav1.Now()
+				if playbook.Type == "apply" {
+					if workflow.Status.ApplyScheduleStatus == nil {
+						workflow.Status.ApplyScheduleStatus = &k8siblev1alpha1.ScheduleStatus{}
+					}
+					workflow.Status.ApplyScheduleStatus.LastScheduledTime = &now
+				} else if playbook.Type == "reconcile" {
+					if workflow.Status.ReconcileScheduleStatus == nil {
+						workflow.Status.ReconcileScheduleStatus = &k8siblev1alpha1.ScheduleStatus{}
+					}
+					workflow.Status.ReconcileScheduleStatus.LastScheduledTime = &now
+				}
+
+				r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonScheduledRun,
+					"Scheduled run triggered for %s playbook", playbook.Type)
+
+				l.Info("Added playbook to pending queue (scheduled run)",
+					"type", playbook.Type,
+					"schedule", playbook.Schedule,
+					"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+			}
 		}
 	}
 
@@ -270,13 +290,100 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// Calculate next requeue time based on schedules
+	requeueAfter := r.calculateRequeueAfter(workflow, playbooks)
+
 	if len(workflow.Status.PendingPlaybooks) > 0 {
 		l.Info("More playbooks pending, will requeue to check job status",
 			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
 		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: time.Minute * 3}, nil
+	l.Info("Reconcile complete, requeuing", "requeueAfter", requeueAfter)
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// isScheduledRunDue checks if a scheduled run should be triggered
+func (r *K8sibleWorkflowReconciler) isScheduledRunDue(workflow *k8siblev1alpha1.K8sibleWorkflow, playbook Playbook) (bool, error) {
+	if playbook.Schedule == "" {
+		return false, nil
+	}
+
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(playbook.Schedule)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse cron schedule: %w", err)
+	}
+
+	now := time.Now()
+
+	// Get last scheduled time
+	var lastScheduled time.Time
+	if playbook.Type == "apply" && workflow.Status.ApplyScheduleStatus != nil &&
+		workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
+		lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
+	} else if playbook.Type == "reconcile" && workflow.Status.ReconcileScheduleStatus != nil &&
+		workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
+		lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
+	} else {
+		// If never scheduled, use workflow creation time as baseline
+		lastScheduled = workflow.CreationTimestamp.Time
+	}
+
+	// Get next scheduled time after last run
+	nextRun := schedule.Next(lastScheduled)
+
+	// If next run time has passed, we should trigger
+	return now.After(nextRun), nil
+}
+
+// calculateRequeueAfter determines the optimal requeue duration based on schedules
+func (r *K8sibleWorkflowReconciler) calculateRequeueAfter(workflow *k8siblev1alpha1.K8sibleWorkflow, playbooks []Playbook) time.Duration {
+	// Default requeue interval for commit checking
+	minRequeue := time.Minute * 3
+
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	now := time.Now()
+
+	for _, playbook := range playbooks {
+		if playbook.Schedule == "" {
+			continue
+		}
+
+		schedule, err := parser.Parse(playbook.Schedule)
+		if err != nil {
+			continue
+		}
+
+		// Get last scheduled time
+		var lastScheduled time.Time
+		if playbook.Type == "apply" && workflow.Status.ApplyScheduleStatus != nil &&
+			workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
+			lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
+		} else if playbook.Type == "reconcile" && workflow.Status.ReconcileScheduleStatus != nil &&
+			workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
+			lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
+		} else {
+			lastScheduled = workflow.CreationTimestamp.Time
+		}
+
+		nextRun := schedule.Next(lastScheduled)
+		timeUntilNext := nextRun.Sub(now)
+
+		// If next run is in the past, requeue soon
+		if timeUntilNext <= 0 {
+			timeUntilNext = time.Second * 10
+		}
+
+		// Add a small buffer to ensure we're past the scheduled time
+		timeUntilNext += time.Second * 5
+
+		if timeUntilNext < minRequeue {
+			minRequeue = timeUntilNext
+		}
+	}
+
+	return minRequeue
 }
 
 // getGitToken retrieves the git token from the referenced secret
@@ -640,131 +747,11 @@ func (r *K8sibleWorkflowReconciler) reconcileJob(ctx context.Context, workflow *
 	return nil
 }
 
-func (r *K8sibleWorkflowReconciler) reconcileCronJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbook Playbook) error {
-	l := logf.FromContext(ctx)
-
-	cronJobName := fmt.Sprintf("%s-%s", workflow.Name, playbook.Type)
-	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source)
-
-	existingCronJob := &batchv1.CronJob{}
-	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: workflow.Namespace}, existingCronJob)
-
-	cronJobSpec := batchv1.CronJobSpec{
-		Schedule:          playbook.Schedule,
-		ConcurrencyPolicy: batchv1.ForbidConcurrent,
-		JobTemplate: batchv1.JobTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by":       "k8sible",
-					"app.kubernetes.io/k8sible-workflow": workflow.Name,
-					"app.kubernetes.io/k8sible-type":     playbook.Type,
-				},
-			},
-			Spec: batchv1.JobSpec{
-				BackoffLimit:            ptr.To(playbook.MaxRetries),
-				TTLSecondsAfterFinished: ptr.To(int32(3600)),
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{
-							"app.kubernetes.io/managed-by":       "k8sible",
-							"app.kubernetes.io/k8sible-workflow": workflow.Name,
-							"app.kubernetes.io/k8sible-type":     playbook.Type,
-						},
-					},
-					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyNever,
-						Containers: []corev1.Container{
-							{
-								Name:    "ansible",
-								Image:   "quay.io/ansible/ansible-runner:latest",
-								Command: []string{"ansible-pull"},
-								Args:    ansiblePullArgs,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	if err == nil {
-		if existingCronJob.Spec.Schedule == playbook.Schedule &&
-			*existingCronJob.Spec.JobTemplate.Spec.BackoffLimit == playbook.MaxRetries {
-			l.Info("CronJob unchanged, skipping update",
-				"cronjob", cronJobName,
-				"schedule", playbook.Schedule)
-			return nil
-		}
-
-		l.Info("Updating CronJob",
-			"cronjob", cronJobName,
-			"oldSchedule", existingCronJob.Spec.Schedule,
-			"newSchedule", playbook.Schedule)
-
-		existingCronJob.Spec = cronJobSpec
-		return r.Update(ctx, existingCronJob)
-	}
-
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	l.Info("Creating new CronJob",
-		"cronjob", cronJobName,
-		"schedule", playbook.Schedule,
-		"backoffLimit", playbook.MaxRetries)
-
-	cronJob := &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cronJobName,
-			Namespace: workflow.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by":       "k8sible",
-				"app.kubernetes.io/k8sible-workflow": workflow.Name,
-				"app.kubernetes.io/k8sible-type":     playbook.Type,
-			},
-		},
-		Spec: cronJobSpec,
-	}
-
-	if err := controllerutil.SetControllerReference(workflow, cronJob, r.Scheme); err != nil {
-		return err
-	}
-
-	if err := r.Create(ctx, cronJob); err != nil {
-		return err
-	}
-
-	l.Info("CronJob created", "cronjob", cronJobName, "schedule", playbook.Schedule, "backoffLimit", playbook.MaxRetries)
-	return nil
-}
-
-func (r *K8sibleWorkflowReconciler) deleteCronJobIfExists(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbookType string) error {
-	l := logf.FromContext(ctx)
-
-	cronJobName := fmt.Sprintf("%s-%s", workflow.Name, playbookType)
-
-	existingCronJob := &batchv1.CronJob{}
-	err := r.Get(ctx, client.ObjectKey{Name: cronJobName, Namespace: workflow.Namespace}, existingCronJob)
-
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-
-	if err != nil {
-		return err
-	}
-
-	l.Info("Deleting CronJob (schedule removed)", "cronjob", cronJobName)
-	return r.Delete(ctx, existingCronJob)
-}
-
 func (r *K8sibleWorkflowReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k8siblev1alpha1.K8sibleWorkflow{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&batchv1.Job{}).
-		Owns(&batchv1.CronJob{}).
 		Named("k8sibleworkflow").
 		Complete(r)
 }
