@@ -14,7 +14,23 @@ spec:
     singular: k8sibleworkflow
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.source.repository
+      name: Repository
+      type: string
+    - jsonPath: .status.pendingPlaybooks
+      name: Pending
+      type: string
+    - jsonPath: .status.lastSuccessfulRun.endTime
+      name: Last Success
+      type: date
+    - jsonPath: .status.lastFailedRun.endTime
+      name: Last Failure
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: K8sibleWorkflow is the Schema for the k8sibleworkflows API
@@ -52,6 +68,13 @@ spec:
                 required:
                 - path
                 type: object
+              maxRetries:
+                default: 3
+                description: MaxRetries is the maximum number of retry attempts for
+                  failed jobs
+                maximum: 10
+                minimum: 0
+                type: integer
               reconcile:
                 description: Reconcile defines the optional reconcile playbook configuration
                 properties:
@@ -83,6 +106,8 @@ spec:
             description: status defines the observed state of K8sibleWorkflow
             properties:
               conditions:
+                description: Conditions represent the current state of the K8sibleWorkflow
+                  resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -141,12 +166,76 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastFailedRun:
+                description: LastFailedRun contains information about the last failed
+                  playbook run
+                properties:
+                  changed:
+                    description: Changed indicates if the playbook made changes
+                    type: boolean
+                  endTime:
+                    description: EndTime is when the job ended
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message contains additional information about the
+                      run
+                    type: string
+                  startTime:
+                    description: StartTime is when the job started
+                    format: date-time
+                    type: string
+                  succeeded:
+                    description: Succeeded indicates if the job succeeded
+                    type: boolean
+                  type:
+                    description: Type is the playbook type (apply or reconcile)
+                    type: string
+                required:
+                - succeeded
+                - type
+                type: object
+              lastSuccessfulRun:
+                description: LastSuccessfulRun contains information about the last
+                  successful playbook run
+                properties:
+                  changed:
+                    description: Changed indicates if the playbook made changes
+                    type: boolean
+                  endTime:
+                    description: EndTime is when the job ended
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message contains additional information about the
+                      run
+                    type: string
+                  startTime:
+                    description: StartTime is when the job started
+                    format: date-time
+                    type: string
+                  succeeded:
+                    description: Succeeded indicates if the job succeeded
+                    type: boolean
+                  type:
+                    description: Type is the playbook type (apply or reconcile)
+                    type: string
+                required:
+                - succeeded
+                - type
+                type: object
               pendingPlaybooks:
                 description: PendingPlaybooks is a list of playbook types waiting
                   to be executed
                 items:
                   type: string
                 type: array
+              retryCount:
+                additionalProperties:
+                  type: integer
+                description: RetryCount tracks the number of retries for each playbook
+                  type
+                type: object
             type: object
         required:
         - spec

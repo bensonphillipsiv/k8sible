@@ -20,21 +20,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// NOTE: json tags are required. Any new fields you add must have json tags for the fields to be serialized.
 
 type SourceSpec struct {
 	Repository string `json:"repository"`
 	Reference  string `json:"reference,omitempty"`
-}
-
-type ApplySpec struct {
-	Path     string `json:"path"`
-	Schedule string `json:"schedule,omitempty"`
-}
-
-type ReconcileSpec struct {
-	Path     string `json:"path"`
-	Schedule string `json:"schedule,omitempty"`
 }
 
 // PlaybookSpec defines a playbook configuration
@@ -58,30 +48,59 @@ type K8sibleWorkflowSpec struct {
 	// Reconcile defines the optional reconcile playbook configuration
 	// +optional
 	Reconcile *PlaybookSpec `json:"reconcile,omitempty"`
+
+	// MaxRetries is the maximum number of retry attempts for failed jobs
+	// +optional
+	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	MaxRetries int `json:"maxRetries,omitempty"`
+}
+
+// PlaybookRunStatus represents the status of a playbook run
+type PlaybookRunStatus struct {
+	// Type is the playbook type (apply or reconcile)
+	Type string `json:"type"`
+
+	// StartTime is when the job started
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// EndTime is when the job ended
+	// +optional
+	EndTime *metav1.Time `json:"endTime,omitempty"`
+
+	// Succeeded indicates if the job succeeded
+	Succeeded bool `json:"succeeded"`
+
+	// Changed indicates if the playbook made changes
+	// +optional
+	Changed bool `json:"changed,omitempty"`
+
+	// Message contains additional information about the run
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
 type K8sibleWorkflowStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the K8sibleWorkflow resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
-
 	// PendingPlaybooks is a list of playbook types waiting to be executed
 	// +optional
 	PendingPlaybooks []string `json:"pendingPlaybooks,omitempty"`
 
+	// RetryCount tracks the number of retries for each playbook type
+	// +optional
+	RetryCount map[string]int `json:"retryCount,omitempty"`
+
+	// LastSuccessfulRun contains information about the last successful playbook run
+	// +optional
+	LastSuccessfulRun *PlaybookRunStatus `json:"lastSuccessfulRun,omitempty"`
+
+	// LastFailedRun contains information about the last failed playbook run
+	// +optional
+	LastFailedRun *PlaybookRunStatus `json:"lastFailedRun,omitempty"`
+
+	// Conditions represent the current state of the K8sibleWorkflow resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -90,6 +109,11 @@ type K8sibleWorkflowStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.source.repository`
+// +kubebuilder:printcolumn:name="Pending",type=string,JSONPath=`.status.pendingPlaybooks`
+// +kubebuilder:printcolumn:name="Last Success",type=date,JSONPath=`.status.lastSuccessfulRun.endTime`
+// +kubebuilder:printcolumn:name="Last Failure",type=date,JSONPath=`.status.lastFailedRun.endTime`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // K8sibleWorkflow is the Schema for the k8sibleworkflows API
 type K8sibleWorkflow struct {

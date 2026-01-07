@@ -22,6 +22,11 @@
       ansible.builtin.debug:
         msg: "Playbook completed successfully!"
 
+    - name: Fail if condition is true
+      fail:
+        msg: "Condition triggered failure"
+      when: false
+
     - name: Sleep some
       ansible.builtin.pause:
-        seconds: 45
+        seconds: 30
