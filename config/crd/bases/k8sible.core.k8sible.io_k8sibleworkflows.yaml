@@ -21,6 +21,9 @@ spec:
     - jsonPath: .status.pendingPlaybooks
       name: Pending
       type: string
+    - jsonPath: .status.failureCycleStatus.inCooldown
+      name: Cooldown
+      type: boolean
     - jsonPath: .status.lastSuccessfulRun.endTime
       name: Last Success
       type: date
@@ -76,6 +79,13 @@ spec:
                 required:
                 - path
                 type: object
+              failureCycleCooldown:
+                description: |-
+                  FailureCycleCooldown is the duration to wait before retrying after max retries exhausted.
+                  If not set, always retry immediately (can cause cycles).
+                  If set to "0", never retry after max retries (manual intervention required).
+                  Examples: "1h", "30m", "24h"
+                type: string
               reconcile:
                 description: Reconcile defines the optional reconcile playbook configuration
                 properties:
@@ -131,6 +141,21 @@ spec:
           status:
             description: K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
             properties:
+              applyCommit:
+                description: ApplyCommit tracks the last seen commit for the apply
+                  playbook
+                properties:
+                  date:
+                    description: Date is when the commit was authored
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message is the commit message (truncated)
+                    type: string
+                  sha:
+                    description: SHA is the commit SHA
+                    type: string
+                type: object
               applyScheduleStatus:
                 description: ApplyScheduleStatus tracks the apply playbook schedule
                 properties:
@@ -201,6 +226,30 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failureCycleStatus:
+                description: FailureCycleStatus tracks failure cycle and cooldown
+                  information
+                properties:
+                  consecutiveReconcileFailuresAfterApply:
+                    description: ConsecutiveReconcileFailuresAfterApply tracks reconcile
+                      failures after a reconcile-triggered apply
+                    type: integer
+                  cooldownReason:
+                    description: CooldownReason describes why cooldown was triggered
+                    type: string
+                  cooldownStartTime:
+                    description: CooldownStartTime is when the cooldown period started
+                    format: date-time
+                    type: string
+                  inCooldown:
+                    description: InCooldown indicates if the workflow is currently
+                      in cooldown
+                    type: boolean
+                  reconcileTriggeredApply:
+                    description: ReconcileTriggeredApply tracks if the current apply
+                      was triggered by reconcile failure
+                    type: boolean
+                type: object
               lastFailedRun:
                 description: LastFailedRun contains information about the last failed
                   playbook run
@@ -259,6 +308,21 @@ spec:
                 items:
                   type: string
                 type: array
+              reconcileCommit:
+                description: ReconcileCommit tracks the last seen commit for the reconcile
+                  playbook
+                properties:
+                  date:
+                    description: Date is when the commit was authored
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message is the commit message (truncated)
+                    type: string
+                  sha:
+                    description: SHA is the commit SHA
+                    type: string
+                type: object
               reconcileScheduleStatus:
                 description: ReconcileScheduleStatus tracks the reconcile playbook
                   schedule

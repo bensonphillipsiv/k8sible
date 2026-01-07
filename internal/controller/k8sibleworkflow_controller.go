@@ -24,7 +24,6 @@ import (
 	"github.com/robfig/cron/v3"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -42,11 +41,16 @@ const (
 	DefaultMaxRetries int32 = 3
 
 	// Event reasons
-	EventReasonJobStarted       = "JobStarted"
-	EventReasonJobSucceeded     = "JobSucceeded"
-	EventReasonJobFailed        = "JobFailed"
-	EventReasonReconcileTrigger = "ReconcileTriggeredApply"
-	EventReasonScheduledRun     = "ScheduledRun"
+	EventReasonJobStarted         = "JobStarted"
+	EventReasonJobSucceeded       = "JobSucceeded"
+	EventReasonJobFailed          = "JobFailed"
+	EventReasonReconcileTrigger   = "ReconcileTriggeredApply"
+	EventReasonScheduledRun       = "ScheduledRun"
+	EventReasonCooldownStarted    = "CooldownStarted"
+	EventReasonCooldownEnded      = "CooldownEnded"
+	EventReasonCooldownBlocked    = "CooldownBlocked"
+	EventReasonPermanentlyBlocked = "PermanentlyBlocked"
+	EventReasonCycleDetected      = "CycleDetected"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
@@ -64,6 +68,15 @@ type Playbook struct {
 	Schedule   string // cron schedule (optional)
 	MaxRetries int32
 }
+
+// TriggerSource indicates what triggered a job
+type TriggerSource string
+
+const (
+	TriggerSourceCommit           TriggerSource = "commit"
+	TriggerSourceSchedule         TriggerSource = "schedule"
+	TriggerSourceReconcileFailure TriggerSource = "reconcile-failure"
+)
 
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=k8sible.core.k8sible.io,resources=k8sibleworkflows/status,verbs=get;update;patch
@@ -84,6 +97,11 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Initialize failure cycle status if needed
+	if workflow.Status.FailureCycleStatus == nil {
+		workflow.Status.FailureCycleStatus = &k8siblev1alpha1.FailureCycleStatus{}
+	}
+
 	l.Info("K8sibleWorkflow",
 		"name", workflow.Name,
 		"repo", workflow.Spec.Source.Repository,
@@ -91,7 +109,11 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"applyPath", workflow.Spec.Apply.Path,
 		"applySchedule", workflow.Spec.Apply.Schedule,
 		"pendingPlaybooks", workflow.Status.PendingPlaybooks,
+		"inCooldown", workflow.Status.FailureCycleStatus.InCooldown,
 	)
+
+	// Check and handle cooldown expiry
+	r.checkCooldownExpiry(ctx, workflow)
 
 	// Get git token from secret if configured
 	gitToken, err := r.getGitToken(ctx, workflow)
@@ -167,19 +189,32 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			"date", commitInfo.Date)
 
 		// Reconcile the commit tracking ConfigMap
-		configMapName, updated, err := r.reconcileConfigMap(ctx, workflow, commitInfo, playbook)
+		// With:
+		updated, err := r.checkForNewCommit(ctx, workflow, commitInfo, playbook)
 		if err != nil {
-			l.Error(err, "failed to reconcile commit ConfigMap")
+			l.Error(err, "failed to check commit")
 			return ctrl.Result{}, err
 		}
-		l.Info("Reconciled commit tracking ConfigMap",
-			"configmap", configMapName,
+		l.Info("Checked commit",
+			"type", playbook.Type,
+			"sha", commitInfo.SHA,
 			"updated", updated)
 
 		// If commit changed, add to pending playbooks for immediate execution
+		// New commits clear cooldown state as they represent new code to try
 		if updated && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
 			statusUpdated = true
+
+			// Clear cooldown on new commit - fresh code deserves a fresh start
+			if workflow.Status.FailureCycleStatus.InCooldown {
+				r.clearCooldown(ctx, workflow, "new commit detected")
+			}
+
+			// Reset cycle tracking on new commit
+			workflow.Status.FailureCycleStatus.ReconcileTriggeredApply = false
+			workflow.Status.FailureCycleStatus.ConsecutiveReconcileFailuresAfterApply = 0
+
 			l.Info("Added playbook to pending queue (new commit detected)",
 				"type", playbook.Type,
 				"commit", commitInfo.SHA,
@@ -193,7 +228,6 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				l.Error(err, "failed to check schedule",
 					"type", playbook.Type,
 					"schedule", playbook.Schedule)
-				// Don't fail the reconcile, just skip scheduling
 			} else if shouldRun && !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
 				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
 				statusUpdated = true
@@ -290,7 +324,7 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Calculate next requeue time based on schedules
+	// Calculate next requeue time based on schedules and cooldown
 	requeueAfter := r.calculateRequeueAfter(workflow, playbooks)
 
 	if len(workflow.Status.PendingPlaybooks) > 0 {
@@ -301,6 +335,197 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	l.Info("Reconcile complete, requeuing", "requeueAfter", requeueAfter)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// checkCooldownExpiry checks if cooldown has expired and clears it
+func (r *K8sibleWorkflowReconciler) checkCooldownExpiry(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) {
+	if !workflow.Status.FailureCycleStatus.InCooldown {
+		return
+	}
+
+	if workflow.Spec.FailureCycleCooldown == nil {
+		// No cooldown configured, should not be in cooldown
+		r.clearCooldown(ctx, workflow, "cooldown not configured")
+		return
+	}
+
+	if workflow.Status.FailureCycleStatus.CooldownStartTime == nil {
+		// No start time, clear cooldown
+		r.clearCooldown(ctx, workflow, "no cooldown start time")
+		return
+	}
+
+	cooldownDuration := workflow.Spec.FailureCycleCooldown.Duration
+	if cooldownDuration == 0 {
+		// Cooldown is 0, meaning never retry - stay in cooldown permanently
+		return
+	}
+
+	elapsed := time.Since(workflow.Status.FailureCycleStatus.CooldownStartTime.Time)
+	if elapsed >= cooldownDuration {
+		r.clearCooldown(ctx, workflow, "cooldown period expired")
+	}
+}
+
+// clearCooldown clears the cooldown state
+func (r *K8sibleWorkflowReconciler) clearCooldown(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, reason string) {
+	l := logf.FromContext(ctx)
+
+	workflow.Status.FailureCycleStatus.InCooldown = false
+	workflow.Status.FailureCycleStatus.CooldownStartTime = nil
+	workflow.Status.FailureCycleStatus.CooldownReason = ""
+
+	l.Info("Cooldown cleared", "reason", reason)
+	r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownEnded,
+		"Cooldown period ended: %s", reason)
+}
+
+// startCooldown initiates the cooldown period
+func (r *K8sibleWorkflowReconciler) startCooldown(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, reason string) {
+	l := logf.FromContext(ctx)
+
+	now := metav1.Now()
+	workflow.Status.FailureCycleStatus.InCooldown = true
+	workflow.Status.FailureCycleStatus.CooldownStartTime = &now
+	workflow.Status.FailureCycleStatus.CooldownReason = reason
+
+	if workflow.Spec.FailureCycleCooldown != nil && workflow.Spec.FailureCycleCooldown.Duration == 0 {
+		l.Info("Cooldown started (permanent - manual intervention required)", "reason", reason)
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonPermanentlyBlocked,
+			"Workflow blocked permanently until manual intervention: %s", reason)
+	} else if workflow.Spec.FailureCycleCooldown != nil {
+		l.Info("Cooldown started",
+			"reason", reason,
+			"duration", workflow.Spec.FailureCycleCooldown.Duration)
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonCooldownStarted,
+			"Cooldown started for %s: %s", workflow.Spec.FailureCycleCooldown.Duration, reason)
+	}
+}
+
+// shouldBlockDueToColldown determines if a failure-triggered retry should be blocked
+func (r *K8sibleWorkflowReconciler) shouldBlockDueToCooldown(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) bool {
+	l := logf.FromContext(ctx)
+
+	// If in cooldown, block
+	if workflow.Status.FailureCycleStatus.InCooldown {
+		// Check if cooldown is permanent (duration = 0)
+		if workflow.Spec.FailureCycleCooldown != nil && workflow.Spec.FailureCycleCooldown.Duration == 0 {
+			l.Info("Blocking retry due to permanent cooldown (failureCycleCooldown=0)")
+			r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonCooldownBlocked,
+				"Retry blocked: permanent cooldown active, manual intervention required")
+			return true
+		}
+
+		l.Info("Blocking retry due to active cooldown",
+			"cooldownReason", workflow.Status.FailureCycleStatus.CooldownReason,
+			"cooldownStartTime", workflow.Status.FailureCycleStatus.CooldownStartTime)
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonCooldownBlocked,
+			"Retry blocked: cooldown active until %s",
+			workflow.Status.FailureCycleStatus.CooldownStartTime.Add(workflow.Spec.FailureCycleCooldown.Duration))
+		return true
+	}
+
+	return false
+}
+
+// handleApplyFailure handles an apply job failure after max retries
+func (r *K8sibleWorkflowReconciler) handleApplyFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, failureMessage string) {
+	l := logf.FromContext(ctx)
+
+	// If failureCycleCooldown is not set, always retry immediately (can cause cycles)
+	if workflow.Spec.FailureCycleCooldown == nil {
+		l.Info("Apply failed, retrying immediately (no failureCycleCooldown set)")
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
+			"Apply job failed, retrying immediately (no cooldown configured)")
+
+		if !contains(workflow.Status.PendingPlaybooks, "apply") {
+			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "apply")
+		}
+		return
+	}
+
+	// If failureCycleCooldown is 0, never retry
+	if workflow.Spec.FailureCycleCooldown.Duration == 0 {
+		l.Info("Apply failed, blocking permanently (failureCycleCooldown=0)")
+		r.startCooldown(ctx, workflow, "apply job failed after max retries")
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonPermanentlyBlocked,
+			"Apply job failed after max retries. Manual intervention required (failureCycleCooldown=0)")
+		return
+	}
+
+	// Start cooldown
+	l.Info("Apply failed, starting cooldown", "duration", workflow.Spec.FailureCycleCooldown.Duration)
+	r.startCooldown(ctx, workflow, fmt.Sprintf("apply job failed: %s", failureMessage))
+
+	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
+		"Apply job failed after max retries. Cooldown for %s before retry.",
+		workflow.Spec.FailureCycleCooldown.Duration)
+}
+
+// handleReconcileFailure handles a reconcile job failure after max retries
+func (r *K8sibleWorkflowReconciler) handleReconcileFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, failureMessage string, playbookMap map[string]Playbook) {
+	l := logf.FromContext(ctx)
+
+	// Check if this is a cycle: reconcile-triggered apply succeeded but reconcile failed again
+	if workflow.Status.FailureCycleStatus.ReconcileTriggeredApply {
+		workflow.Status.FailureCycleStatus.ConsecutiveReconcileFailuresAfterApply++
+
+		l.Info("Reconcile failed after reconcile-triggered apply",
+			"consecutiveFailures", workflow.Status.FailureCycleStatus.ConsecutiveReconcileFailuresAfterApply)
+
+		// This is a cycle - apply works but reconcile keeps failing
+		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonCycleDetected,
+			"Cycle detected: reconcile failed after successful reconcile-triggered apply")
+
+		// If failureCycleCooldown is not set, continue the cycle
+		if workflow.Spec.FailureCycleCooldown == nil {
+			l.Info("Cycle detected but no cooldown set, continuing cycle")
+			r.triggerApplyFromReconcile(ctx, workflow, playbookMap)
+			return
+		}
+
+		// If failureCycleCooldown is 0, block permanently
+		if workflow.Spec.FailureCycleCooldown.Duration == 0 {
+			l.Info("Cycle detected, blocking permanently (failureCycleCooldown=0)")
+			r.startCooldown(ctx, workflow, "reconcile-apply cycle detected")
+			workflow.Status.FailureCycleStatus.ReconcileTriggeredApply = false
+			return
+		}
+
+		// Start cooldown to break the cycle
+		l.Info("Cycle detected, starting cooldown", "duration", workflow.Spec.FailureCycleCooldown.Duration)
+		r.startCooldown(ctx, workflow, "reconcile-apply cycle detected")
+		workflow.Status.FailureCycleStatus.ReconcileTriggeredApply = false
+		return
+	}
+
+	// First reconcile failure (not a cycle yet) - trigger apply
+	l.Info("Reconcile failed, triggering apply")
+	r.triggerApplyFromReconcile(ctx, workflow, playbookMap)
+}
+
+// triggerApplyFromReconcile queues apply and reconcile after a reconcile failure
+func (r *K8sibleWorkflowReconciler) triggerApplyFromReconcile(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbookMap map[string]Playbook) {
+	l := logf.FromContext(ctx)
+
+	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonReconcileTrigger,
+		"Reconcile job failed, triggering apply job")
+
+	// Mark that apply is being triggered by reconcile failure
+	workflow.Status.FailureCycleStatus.ReconcileTriggeredApply = true
+
+	// Queue apply followed by reconcile
+	workflow.Status.PendingPlaybooks = []string{}
+
+	if _, ok := playbookMap["apply"]; ok {
+		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "apply")
+	}
+	if _, ok := playbookMap["reconcile"]; ok {
+		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
+	}
+
+	l.Info("Queued apply and reconcile after reconcile failure",
+		"pendingPlaybooks", workflow.Status.PendingPlaybooks)
 }
 
 // isScheduledRunDue checks if a scheduled run should be triggered
@@ -337,10 +562,24 @@ func (r *K8sibleWorkflowReconciler) isScheduledRunDue(workflow *k8siblev1alpha1.
 	return now.After(nextRun), nil
 }
 
-// calculateRequeueAfter determines the optimal requeue duration based on schedules
+// calculateRequeueAfter determines the optimal requeue duration based on schedules and cooldown
 func (r *K8sibleWorkflowReconciler) calculateRequeueAfter(workflow *k8siblev1alpha1.K8sibleWorkflow, playbooks []Playbook) time.Duration {
 	// Default requeue interval for commit checking
 	minRequeue := time.Minute * 3
+
+	// If in cooldown, consider cooldown expiry time
+	if workflow.Status.FailureCycleStatus.InCooldown &&
+		workflow.Spec.FailureCycleCooldown != nil &&
+		workflow.Spec.FailureCycleCooldown.Duration > 0 &&
+		workflow.Status.FailureCycleStatus.CooldownStartTime != nil {
+
+		cooldownEnd := workflow.Status.FailureCycleStatus.CooldownStartTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
+		timeUntilCooldownEnd := time.Until(cooldownEnd)
+
+		if timeUntilCooldownEnd > 0 && timeUntilCooldownEnd < minRequeue {
+			minRequeue = timeUntilCooldownEnd + time.Second*5 // Add buffer
+		}
+	}
 
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	now := time.Now()
@@ -490,6 +729,19 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonJobSucceeded,
 			"Job %s completed successfully", job.Name)
 
+		// Handle success based on playbook type
+		if playbookType == "apply" {
+			// Apply succeeded - if this was a reconcile-triggered apply, keep the flag
+			// so we can detect a cycle if reconcile fails again
+			l.Info("Apply job succeeded",
+				"reconcileTriggeredApply", workflow.Status.FailureCycleStatus.ReconcileTriggeredApply)
+		} else if playbookType == "reconcile" {
+			// Reconcile succeeded - clear all cycle tracking
+			workflow.Status.FailureCycleStatus.ReconcileTriggeredApply = false
+			workflow.Status.FailureCycleStatus.ConsecutiveReconcileFailuresAfterApply = 0
+			l.Info("Reconcile job succeeded, clearing cycle tracking")
+		}
+
 		return nil
 	}
 
@@ -520,23 +772,17 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
 		"Job %s failed after all retries: %s", job.Name, failureMessage)
 
-	if playbookType == "reconcile" {
-		// Reconcile job failed after max retries - trigger apply
-		r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonReconcileTrigger,
-			"Reconcile job failed, triggering apply job")
+	// Check if we should block due to cooldown
+	if r.shouldBlockDueToCooldown(ctx, workflow) {
+		l.Info("Not retrying due to active cooldown")
+		return nil
+	}
 
-		// Queue apply followed by reconcile
-		workflow.Status.PendingPlaybooks = []string{}
-
-		if _, ok := playbookMap["apply"]; ok {
-			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "apply")
-		}
-		if _, ok := playbookMap["reconcile"]; ok {
-			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
-		}
-
-		l.Info("Queued apply and reconcile after reconcile failure",
-			"pendingPlaybooks", workflow.Status.PendingPlaybooks)
+	// Handle failure based on playbook type
+	if playbookType == "apply" {
+		r.handleApplyFailure(ctx, workflow, failureMessage)
+	} else if playbookType == "reconcile" {
+		r.handleReconcileFailure(ctx, workflow, failureMessage, playbookMap)
 	}
 
 	return nil
@@ -605,76 +851,59 @@ func (r *K8sibleWorkflowReconciler) isAnyJobRunning(ctx context.Context, workflo
 	return false, nil
 }
 
-func (r *K8sibleWorkflowReconciler) reconcileConfigMap(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, commitInfo *git.CommitInfo, playbook Playbook) (string, bool, error) {
+// checkForNewCommit checks if there's a new commit and updates status
+func (r *K8sibleWorkflowReconciler) checkForNewCommit(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, commitInfo *git.CommitInfo, playbook Playbook) (bool, error) {
 	l := logf.FromContext(ctx)
-	configMapName := workflow.Name + "-" + playbook.Type + "-commit"
 
-	existingConfigMap := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKey{Name: configMapName, Namespace: workflow.Namespace}, existingConfigMap)
-
-	if err == nil {
-		existingCommit := existingConfigMap.Data["commit"]
-		if existingCommit == commitInfo.SHA {
-			l.Info("Commit unchanged, skipping update",
-				"configmap", configMapName,
-				"commit", commitInfo.SHA)
-			return configMapName, false, nil
-		}
-
-		l.Info("New commit detected, updating",
-			"configmap", configMapName,
-			"oldCommit", existingCommit,
-			"newCommit", commitInfo.SHA)
-
-		existingConfigMap.Data = map[string]string{
-			"commit":  commitInfo.SHA,
-			"date":    commitInfo.Date.Format(time.RFC3339),
-			"message": commitInfo.Message,
-			"path":    playbook.Source.Path,
-		}
-
-		if err := r.Update(ctx, existingConfigMap); err != nil {
-			return "", false, err
-		}
-
-		return configMapName, true, nil
+	var currentCommit *k8siblev1alpha1.CommitStatus
+	if playbook.Type == "apply" {
+		currentCommit = workflow.Status.ApplyCommit
+	} else if playbook.Type == "reconcile" {
+		currentCommit = workflow.Status.ReconcileCommit
 	}
 
-	if !apierrors.IsNotFound(err) {
-		return "", false, err
+	// Check if commit changed
+	if currentCommit != nil && currentCommit.SHA == commitInfo.SHA {
+		l.Info("Commit unchanged",
+			"type", playbook.Type,
+			"sha", commitInfo.SHA)
+		return false, nil
 	}
 
-	l.Info("Creating new commit tracking ConfigMap",
-		"configmap", configMapName,
-		"commit", commitInfo.SHA)
+	// New commit detected - update status
+	l.Info("New commit detected",
+		"type", playbook.Type,
+		"oldSHA", getSHA(currentCommit),
+		"newSHA", commitInfo.SHA)
 
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: workflow.Namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by":   "k8sible",
-				"app.kubernetes.io/name":         workflow.Name,
-				"app.kubernetes.io/k8sible-type": playbook.Type,
-			},
-		},
-		Data: map[string]string{
-			"commit":  commitInfo.SHA,
-			"date":    commitInfo.Date.Format(time.RFC3339),
-			"message": commitInfo.Message,
-			"path":    playbook.Source.Path,
-		},
+	commitDate := metav1.NewTime(commitInfo.Date)
+	newCommitStatus := &k8siblev1alpha1.CommitStatus{
+		SHA:     commitInfo.SHA,
+		Date:    &commitDate,
+		Message: truncateMessage(commitInfo.Message, 100),
 	}
 
-	if err := controllerutil.SetControllerReference(workflow, configMap, r.Scheme); err != nil {
-		return "", false, err
+	if playbook.Type == "apply" {
+		workflow.Status.ApplyCommit = newCommitStatus
+	} else if playbook.Type == "reconcile" {
+		workflow.Status.ReconcileCommit = newCommitStatus
 	}
 
-	if err := r.Create(ctx, configMap); err != nil {
-		return "", false, err
-	}
+	return true, nil
+}
 
-	return configMapName, true, nil
+func getSHA(commit *k8siblev1alpha1.CommitStatus) string {
+	if commit == nil {
+		return "<none>"
+	}
+	return commit.SHA
+}
+
+func truncateMessage(msg string, maxLen int) string {
+	if len(msg) <= maxLen {
+		return msg
+	}
+	return msg[:maxLen-3] + "..."
 }
 
 func buildAnsiblePullArgs(source git.Source) []string {
