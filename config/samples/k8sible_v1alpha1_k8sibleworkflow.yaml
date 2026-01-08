@@ -20,4 +20,3 @@ spec:
     # schedule: "*/5 * * * *"
     maxRetries: 1
   failureCycleCooldown: 5m
-

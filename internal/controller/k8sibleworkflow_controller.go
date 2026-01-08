@@ -376,6 +376,38 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 		return true, nil
 	}
 
+	// If the last apply failed, don't start a new job until the failureCycleCooldown period has passed
+	if workflow.Spec.FailureCycleCooldown != nil && workflow.Status.LastFailedRun != nil {
+		if workflow.Status.LastFailedRun.Type == "apply" && workflow.Status.LastFailedRun.EndTime != nil && playbookType == "apply" {
+			cooldownEnd := workflow.Status.LastFailedRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
+			if time.Now().Before(cooldownEnd) {
+				l.Info("Apply job in cooldown, waiting",
+					"cooldownEnd", cooldownEnd,
+					"timeRemaining", time.Until(cooldownEnd))
+				return false, nil
+			}
+		}
+
+		// If the last failed job is a reconcile job and the last successful job is an apply job
+		// that occurred at a later date than the reconcile job, don't retrigger a reconcile job
+		// until after the cooldown
+		if workflow.Status.LastFailedRun.Type == "reconcile" &&
+			workflow.Status.LastFailedRun.EndTime != nil &&
+			workflow.Status.LastSuccessfulRun != nil &&
+			workflow.Status.LastSuccessfulRun.Type == "apply" &&
+			workflow.Status.LastSuccessfulRun.EndTime != nil &&
+			workflow.Status.LastSuccessfulRun.EndTime.After(workflow.Status.LastFailedRun.EndTime.Time) &&
+			playbookType == "reconcile" {
+			cooldownEnd := workflow.Status.LastSuccessfulRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
+			if time.Now().Before(cooldownEnd) {
+				l.Info("Reconcile job in cooldown after apply succeeded, waiting",
+					"cooldownEnd", cooldownEnd,
+					"timeRemaining", time.Until(cooldownEnd))
+				return false, nil
+			}
+		}
+	}
+
 	// Create the job
 	if err := r.createJob(ctx, workflow, playbook); err != nil {
 		return false, err

@@ -73,6 +73,12 @@ type K8sibleWorkflowSpec struct {
 	// Reconcile defines the optional reconcile playbook configuration
 	// +optional
 	Reconcile *PlaybookSpec `json:"reconcile,omitempty"`
+
+	// FailureCycleCooldown is the duration to wait before retrying after an apply failure.
+	// If not set, retries happen immediately.
+	// Examples: "1h", "30m", "24h"
+	// +optional
+	FailureCycleCooldown *metav1.Duration `json:"failureCycleCooldown,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run
