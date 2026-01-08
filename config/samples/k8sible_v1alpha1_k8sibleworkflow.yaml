@@ -14,9 +14,10 @@ spec:
   apply:
     path: test/ansible/apply_ansible.yaml
     # schedule: "*/10 * * * *"
-    maxRetries: 3
+    maxRetries: 1
   reconcile:
     path: test/ansible/reconcile_ansible.yaml
     # schedule: "*/5 * * * *"
-    maxRetries: 3
-  failureCycleCooldown: 10m
+    maxRetries: 1
+  failureCycleCooldown: 5m
+
