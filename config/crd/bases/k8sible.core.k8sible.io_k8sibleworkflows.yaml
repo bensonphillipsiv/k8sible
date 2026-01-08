@@ -274,6 +274,11 @@ spec:
                 - succeeded
                 - type
                 type: object
+              lastTriggerReason:
+                description: |-
+                  LastTriggerReason indicates why the pending playbooks were queued
+                  Values: "new_commit", "schedule", "failure_retry"
+                type: string
               pendingPlaybooks:
                 description: PendingPlaybooks is a list of playbook types waiting
                   to be executed

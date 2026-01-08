@@ -137,6 +137,11 @@ type K8sibleWorkflowStatus struct {
 	// +optional
 	PendingPlaybooks []string `json:"pendingPlaybooks,omitempty"`
 
+	// LastTriggerReason indicates why the pending playbooks were queued
+	// Values: "new_commit", "schedule", "failure_retry"
+	// +optional
+	LastTriggerReason string `json:"lastTriggerReason,omitempty"`
+
 	// LastSuccessfulRun contains information about the last successful playbook run
 	// +optional
 	LastSuccessfulRun *PlaybookRunStatus `json:"lastSuccessfulRun,omitempty"`
