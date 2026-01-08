@@ -47,6 +47,7 @@ const (
 	EventReasonReconcileTrigger = "ReconcileTriggeredApply"
 	EventReasonScheduledRun     = "ScheduledRun"
 	EventReasonNewCommit        = "NewCommit"
+	EventReasonCooldownWaiting  = "CooldownWaiting"
 
 	// Trigger reasons for pending playbooks
 	TriggerReasonNewCommit    = "new_commit"
@@ -395,6 +396,8 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 				l.Info("Apply job in cooldown, waiting",
 					"cooldownEnd", cooldownEnd,
 					"timeRemaining", time.Until(cooldownEnd))
+				r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownWaiting,
+					"Apply job in cooldown, next retry at %s", cooldownEnd.Format(time.RFC3339))
 				return false, nil
 			}
 		}
@@ -414,6 +417,8 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 				l.Info("Reconcile job in cooldown after apply succeeded, waiting",
 					"cooldownEnd", cooldownEnd,
 					"timeRemaining", time.Until(cooldownEnd))
+				r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownWaiting,
+					"Reconcile job in cooldown after apply succeeded, next retry at %s", cooldownEnd.Format(time.RFC3339))
 				return false, nil
 			}
 		}
