@@ -73,13 +73,6 @@ type K8sibleWorkflowSpec struct {
 	// Reconcile defines the optional reconcile playbook configuration
 	// +optional
 	Reconcile *PlaybookSpec `json:"reconcile,omitempty"`
-
-	// FailureCycleCooldown is the duration to wait before retrying after max retries exhausted.
-	// If not set, always retry immediately (can cause cycles).
-	// If set to "0", never retry after max retries (manual intervention required).
-	// Examples: "1h", "30m", "24h"
-	// +optional
-	FailureCycleCooldown *metav1.Duration `json:"failureCycleCooldown,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run
@@ -124,26 +117,6 @@ type CommitStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-// FailureCycleStatus tracks failure cycle information
-type FailureCycleStatus struct {
-	// InCooldown indicates if the workflow is currently in cooldown
-	InCooldown bool `json:"inCooldown,omitempty"`
-
-	// CooldownStartTime is when the cooldown period started
-	// +optional
-	CooldownStartTime *metav1.Time `json:"cooldownStartTime,omitempty"`
-
-	// CooldownReason describes why cooldown was triggered
-	// +optional
-	CooldownReason string `json:"cooldownReason,omitempty"`
-
-	// ReconcileTriggeredApply tracks if the current apply was triggered by reconcile failure
-	ReconcileTriggeredApply bool `json:"reconcileTriggeredApply,omitempty"`
-
-	// ConsecutiveReconcileFailuresAfterApply tracks reconcile failures after a reconcile-triggered apply
-	ConsecutiveReconcileFailuresAfterApply int `json:"consecutiveReconcileFailuresAfterApply,omitempty"`
-}
-
 // K8sibleWorkflowStatus defines the observed state of K8sibleWorkflow.
 type K8sibleWorkflowStatus struct {
 	// ApplyCommit tracks the last seen commit for the apply playbook
@@ -174,10 +147,6 @@ type K8sibleWorkflowStatus struct {
 	// +optional
 	ReconcileScheduleStatus *ScheduleStatus `json:"reconcileScheduleStatus,omitempty"`
 
-	// FailureCycleStatus tracks failure cycle and cooldown information
-	// +optional
-	FailureCycleStatus *FailureCycleStatus `json:"failureCycleStatus,omitempty"`
-
 	// Conditions represent the current state of the K8sibleWorkflow resource.
 	// +listType=map
 	// +listMapKey=type
@@ -189,7 +158,6 @@ type K8sibleWorkflowStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Repository",type=string,JSONPath=`.spec.source.repository`
 // +kubebuilder:printcolumn:name="Pending",type=string,JSONPath=`.status.pendingPlaybooks`
-// +kubebuilder:printcolumn:name="Cooldown",type=boolean,JSONPath=`.status.failureCycleStatus.inCooldown`
 // +kubebuilder:printcolumn:name="Last Success",type=date,JSONPath=`.status.lastSuccessfulRun.endTime`
 // +kubebuilder:printcolumn:name="Last Failure",type=date,JSONPath=`.status.lastFailedRun.endTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
