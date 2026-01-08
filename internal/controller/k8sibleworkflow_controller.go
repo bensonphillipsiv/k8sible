@@ -559,14 +559,6 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonJobSucceeded,
 			"Job %s completed successfully", job.Name)
 
-		if playbookType == "apply" {
-			// Apply succeeded - queue reconcile if configured and not already pending
-			if workflow.Spec.Reconcile != nil && !contains(workflow.Status.PendingPlaybooks, "reconcile") {
-				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
-				l.Info("Queued reconcile after successful apply")
-			}
-		}
-
 		return nil
 	}
 

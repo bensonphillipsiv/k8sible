@@ -13,10 +13,10 @@ spec:
       name: k8sible-git-credentials
   apply:
     path: test/ansible/apply_ansible.yaml
-    # schedule: "*/10 * * * *"
+    schedule: "*/7 * * * *"
     maxRetries: 1
   reconcile:
     path: test/ansible/reconcile_ansible.yaml
-    # schedule: "*/5 * * * *"
+    schedule: "*/5 * * * *"
     maxRetries: 1
   failureCycleCooldown: 5m
