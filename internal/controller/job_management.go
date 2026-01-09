@@ -59,7 +59,7 @@ func (r *K8sibleWorkflowReconciler) getRunningJob(ctx context.Context, workflow 
 			}
 		}
 
-		isProcessed := job.Annotations != nil && job.Annotations["k8sible.io/processed"] == "true"
+		isProcessed := job.Annotations != nil && job.Annotations[AnnotationProcessed] == AnnotationProcessedValue
 
 		if !isTerminal && !isProcessed {
 			return true, job.Labels["app.kubernetes.io/k8sible-type"], nil
@@ -92,7 +92,7 @@ func (r *K8sibleWorkflowReconciler) processCompletedJobs(ctx context.Context, wo
 		}
 
 		// Skip already processed jobs
-		if job.Annotations != nil && job.Annotations["k8sible.io/processed"] == "true" {
+		if job.Annotations != nil && job.Annotations[AnnotationProcessed] == AnnotationProcessedValue {
 			continue
 		}
 
@@ -137,6 +137,20 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 
 	l.Info("Creating job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries)
 
+	// Build environment variables from secret if specified
+	var envFrom []corev1.EnvFromSource
+	if workflow.Spec.SecretRef != nil {
+		envFrom = []corev1.EnvFromSource{
+			{
+				SecretRef: &corev1.SecretEnvSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: workflow.Spec.SecretRef.Name,
+					},
+				},
+			},
+		}
+	}
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -166,6 +180,7 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 							Image:   "quay.io/ansible/ansible-runner:latest",
 							Command: []string{"ansible-pull"},
 							Args:    ansiblePullArgs,
+							EnvFrom: envFrom,
 						},
 					},
 				},
@@ -190,7 +205,7 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 	if job.Annotations == nil {
 		job.Annotations = make(map[string]string)
 	}
-	job.Annotations["k8sible.io/processed"] = "true"
+	job.Annotations[AnnotationProcessed] = AnnotationProcessedValue
 	if err := r.Update(ctx, job); err != nil {
 		return fmt.Errorf("failed to mark job as processed: %w", err)
 	}
@@ -236,31 +251,32 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 		"Job %s failed: %s", job.Name, failureMessage)
 
 	// Handle failure based on playbook type
-	if playbookType == "apply" {
-		r.handleApplyFailure(ctx, workflow, failureMessage)
-	} else if playbookType == "reconcile" {
-		r.handleReconcileFailure(ctx, workflow, failureMessage)
+	switch playbookType {
+	case PlaybookTypeApply:
+		r.handleApplyFailure(ctx, workflow)
+	case PlaybookTypeReconcile:
+		r.handleReconcileFailure(ctx, workflow)
 	}
 
 	return nil
 }
 
 // handleApplyFailure handles an apply job failure after max retries
-func (r *K8sibleWorkflowReconciler) handleApplyFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, failureMessage string) {
+func (r *K8sibleWorkflowReconciler) handleApplyFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) {
 	l := logf.FromContext(ctx)
 
 	l.Info("Apply failed, retrying immediately")
 	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
 		"Apply job failed, retrying immediately")
 
-	if !contains(workflow.Status.PendingPlaybooks, "apply") {
-		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "apply")
+	if !contains(workflow.Status.PendingPlaybooks, PlaybookTypeApply) {
+		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeApply)
 		workflow.Status.LastTriggerReason = TriggerReasonFailureRetry
 	}
 }
 
 // handleReconcileFailure handles a reconcile job failure after max retries
-func (r *K8sibleWorkflowReconciler) handleReconcileFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, failureMessage string) {
+func (r *K8sibleWorkflowReconciler) handleReconcileFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) {
 	l := logf.FromContext(ctx)
 
 	// Reconcile failure - trigger apply
@@ -275,11 +291,11 @@ func (r *K8sibleWorkflowReconciler) queueApplyAndReconcile(ctx context.Context, 
 	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonReconcileTrigger,
 		"Reconcile failed, triggering apply")
 
-	workflow.Status.PendingPlaybooks = []string{"apply"}
+	workflow.Status.PendingPlaybooks = []string{PlaybookTypeApply}
 	workflow.Status.LastTriggerReason = TriggerReasonFailureRetry
 
 	if workflow.Spec.Reconcile != nil {
-		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
+		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 	}
 
 	l.Info("Queued apply and reconcile", "pending", workflow.Status.PendingPlaybooks)

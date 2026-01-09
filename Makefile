@@ -58,37 +58,12 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: manifests generate fmt vet setup-envtest ## Run unit and integration tests with envtest.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test ./internal/... ./test/integration/... -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
-# The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
-# CertManager is installed by default; skip with:
-# - CERT_MANAGER_INSTALL_SKIP=true
-KIND_CLUSTER ?= k8sible-test-e2e
-
-.PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
-
-.PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
-
-.PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+.PHONY: test-integration
+test-integration: manifests generate fmt vet setup-envtest ## Run integration tests only with envtest.
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test ./test/integration/... -v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -170,6 +145,53 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ Helm
+
+CHART_DIR ?= charts/k8sible
+HELM ?= helm
+
+.PHONY: helm-crds
+helm-crds: manifests ## Copy CRDs to helm chart
+	@mkdir -p $(CHART_DIR)/crds
+	cp config/crd/bases/*.yaml $(CHART_DIR)/crds/
+
+.PHONY: helm-lint
+helm-lint: helm-crds ## Lint helm chart
+	$(HELM) lint $(CHART_DIR)
+
+.PHONY: helm-template
+helm-template: helm-crds ## Render helm templates locally
+	$(HELM) template k8sible $(CHART_DIR) --namespace k8sible
+
+.PHONY: helm-package
+helm-package: helm-crds ## Package helm chart
+	@mkdir -p dist
+	$(HELM) package $(CHART_DIR) -d dist/
+
+.PHONY: helm-install
+helm-install: helm-crds ## Install helm chart to cluster
+	$(HELM) upgrade --install k8sible $(CHART_DIR) \
+		--namespace k8sible \
+		--create-namespace
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall helm chart from cluster
+	$(HELM) uninstall k8sible --namespace k8sible
+
+##@ Release
+
+.PHONY: release-manifests
+release-manifests: manifests kustomize ## Generate release manifests
+	@mkdir -p dist
+	cd config/manager && "$(KUSTOMIZE)" edit set image controller=$(IMG)
+	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+
+.PHONY: release
+release: release-manifests helm-package ## Create all release artifacts
+	@echo "Release artifacts created:"
+	@echo "  - dist/install.yaml"
+	@ls -1 dist/*.tgz 2>/dev/null | sed 's/^/  - /'
 
 ##@ Dependencies
 

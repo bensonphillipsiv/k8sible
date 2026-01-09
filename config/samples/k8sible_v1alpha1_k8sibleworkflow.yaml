@@ -19,3 +19,5 @@ spec:
     schedule: "*/15 * * * *"
     maxRetries: 1
   failureCycleCooldown: 5m
+  secretRef:
+    name: k8sible-creds

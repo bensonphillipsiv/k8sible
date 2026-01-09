@@ -20,6 +20,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type EnvSecretRef struct {
+	// Name is the name of the secret
+	Name string `json:"name"`
+}
+
 // SecretRef references a Kubernetes secret
 type SecretRef struct {
 	// Name is the name of the secret
@@ -79,6 +84,11 @@ type K8sibleWorkflowSpec struct {
 	// Examples: "1h", "30m", "24h"
 	// +optional
 	FailureCycleCooldown *metav1.Duration `json:"failureCycleCooldown,omitempty"`
+
+	// SecretRef references a secret whose keys will be mounted as environment variables
+	// in the ansible job pod
+	// +optional
+	SecretRef *EnvSecretRef `json:"secretRef,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run

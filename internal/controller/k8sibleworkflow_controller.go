@@ -34,6 +34,14 @@ import (
 const (
 	DefaultMaxRetries int32 = 3
 
+	// Playbook types
+	PlaybookTypeApply     = "apply"
+	PlaybookTypeReconcile = "reconcile"
+
+	// Annotation keys and values
+	AnnotationProcessed      = "k8sible.io/processed"
+	AnnotationProcessedValue = "true"
+
 	// Event reasons
 	EventReasonJobStarted       = "JobStarted"
 	EventReasonJobSucceeded     = "JobSucceeded"
@@ -53,7 +61,7 @@ const (
 type K8sibleWorkflowReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
-	GitClient *git.Client
+	GitClient git.ClientInterface
 	Recorder  record.EventRecorder
 }
 
@@ -98,7 +106,12 @@ func (r *K8sibleWorkflowReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		l.Error(err, "failed to process completed jobs")
 		return ctrl.Result{}, err
 	} else if updated {
-		statusUpdated = true
+		// Save status immediately after processing completed jobs to ensure
+		// LastSuccessfulRun/LastFailedRun are persisted before attempting retries
+		if err := r.Status().Update(ctx, workflow); err != nil {
+			l.Error(err, "failed to update workflow status after job completion")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// PHASE 2: Check if ANY job is currently running - if so, just wait
@@ -161,7 +174,7 @@ func (r *K8sibleWorkflowReconciler) buildPlaybookList(workflow *k8siblev1alpha1.
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Apply.Path,
 			},
-			Type:       "apply",
+			Type:       PlaybookTypeApply,
 			Schedule:   workflow.Spec.Apply.Schedule,
 			MaxRetries: getMaxRetries(workflow.Spec.Apply.MaxRetries),
 		},
@@ -174,7 +187,7 @@ func (r *K8sibleWorkflowReconciler) buildPlaybookList(workflow *k8siblev1alpha1.
 				Reference:  workflow.Spec.Source.Reference,
 				Path:       workflow.Spec.Reconcile.Path,
 			},
-			Type:       "reconcile",
+			Type:       PlaybookTypeReconcile,
 			Schedule:   workflow.Spec.Reconcile.Schedule,
 			MaxRetries: getMaxRetries(workflow.Spec.Reconcile.MaxRetries),
 		})
@@ -240,10 +253,10 @@ func contains(slice []string, item string) bool {
 }
 
 func sortPendingPlaybooks(playbooks []string) {
-	for i := 0; i < len(playbooks); i++ {
-		if playbooks[i] == "reconcile" {
+	for i := range playbooks {
+		if playbooks[i] == PlaybookTypeReconcile {
 			for j := i + 1; j < len(playbooks); j++ {
-				if playbooks[j] == "apply" {
+				if playbooks[j] == PlaybookTypeApply {
 					playbooks[i], playbooks[j] = playbooks[j], playbooks[i]
 					return
 				}

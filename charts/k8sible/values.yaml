@@ -1,0 +1,82 @@
+# Default values for k8sible
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/bensonphillipsiv/k8sible
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Leader election configuration
+leaderElection:
+  enabled: true
+
+# Metrics configuration
+metrics:
+  enabled: true
+  service:
+    port: 8443
+    type: ClusterIP
+
+# Health probes
+health:
+  port: 8081
+
+# Controller manager specific settings
+manager:
+  # Additional args to pass to the manager
+  args: []
+  # Environment variables
+  env: []
+
+# RBAC configuration
+rbac:
+  # Specifies whether RBAC resources should be created
+  create: true
+
+# CRD configuration
+crds:
+  # Specifies whether CRDs should be installed
+  install: true
+  # Keep CRDs on helm uninstall
+  keep: true

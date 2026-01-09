@@ -40,10 +40,18 @@ type CommitInfo struct {
 	Date    time.Time
 }
 
+// ClientInterface defines the interface for git operations
+type ClientInterface interface {
+	GetLatestCommit(ctx context.Context, source Source, token string) (*CommitInfo, error)
+}
+
 // Client handles git operations
 type Client struct {
 	httpClient *http.Client
 }
+
+// Ensure Client implements ClientInterface
+var _ ClientInterface = (*Client)(nil)
 
 // ClientOption is a functional option for configuring the Client
 type ClientOption func(*Client)
@@ -91,7 +99,7 @@ func (c *Client) GetLatestCommit(ctx context.Context, source Source, token strin
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch commit info: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to fetch commit info: HTTP %d", resp.StatusCode)

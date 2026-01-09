@@ -1,0 +1,29 @@
+apiVersion: v2
+name: k8sible
+description: A Kubernetes operator for running Ansible playbooks via GitOps
+
+type: application
+
+# Chart version - updated automatically by CI
+version: 0.1.0
+
+# App version - updated automatically by CI
+appVersion: "v0.1.0"
+
+keywords:
+  - kubernetes
+  - operator
+  - ansible
+  - gitops
+  - automation
+
+home: https://github.com/bensonphillipsiv/k8sible
+
+sources:
+  - https://github.com/bensonphillipsiv/k8sible
+
+maintainers:
+  - name: bensonphillipsiv
+    url: https://github.com/bensonphillipsiv
+
+kubeVersion: ">= 1.26.0-0"

@@ -57,19 +57,20 @@ func (r *K8sibleWorkflowReconciler) getGitToken(ctx context.Context, workflow *k
 }
 
 // checkForNewCommit checks if there's a new commit and updates status
-func (r *K8sibleWorkflowReconciler) checkForNewCommit(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, commitInfo *git.CommitInfo, playbook Playbook) (bool, error) {
+func (r *K8sibleWorkflowReconciler) checkForNewCommit(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, commitInfo *git.CommitInfo, playbook Playbook) bool {
 	l := logf.FromContext(ctx)
 
 	var currentCommit *k8siblev1alpha1.CommitStatus
-	if playbook.Type == "apply" {
+	switch playbook.Type {
+	case PlaybookTypeApply:
 		currentCommit = workflow.Status.ApplyCommit
-	} else if playbook.Type == "reconcile" {
+	case PlaybookTypeReconcile:
 		currentCommit = workflow.Status.ReconcileCommit
 	}
 
 	// Check if commit changed
 	if currentCommit != nil && currentCommit.SHA == commitInfo.SHA {
-		return false, nil
+		return false
 	}
 
 	// New commit detected - update status
@@ -85,11 +86,12 @@ func (r *K8sibleWorkflowReconciler) checkForNewCommit(ctx context.Context, workf
 		Message: truncateMessage(commitInfo.Message, 100),
 	}
 
-	if playbook.Type == "apply" {
+	switch playbook.Type {
+	case PlaybookTypeApply:
 		workflow.Status.ApplyCommit = newCommitStatus
-	} else if playbook.Type == "reconcile" {
+	case PlaybookTypeReconcile:
 		workflow.Status.ReconcileCommit = newCommitStatus
 	}
 
-	return true, nil
+	return true
 }

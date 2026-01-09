@@ -1,5 +1,5 @@
 # Adds namespace to all resources.
-namespace: k8sible-system
+namespace: k8sible
 
 # Value of this field is prepended to the
 # names of all resources, e.g. a deployment named

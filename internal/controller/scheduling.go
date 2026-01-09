@@ -34,12 +34,6 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 	l := logf.FromContext(ctx)
 	statusUpdated := false
 
-	// If there's already something pending, don't add more
-	if len(workflow.Status.PendingPlaybooks) > 0 {
-		l.Info("Pending playbooks exist, not determining next job", "pending", workflow.Status.PendingPlaybooks)
-		return false, nil
-	}
-
 	// Get git token
 	gitToken, err := r.getGitToken(ctx, workflow)
 	if err != nil {
@@ -61,14 +55,14 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 			continue
 		}
 
-		updated, err := r.checkForNewCommit(ctx, workflow, commitInfo, playbook)
-		if err != nil {
-			return false, err
-		}
+		updated := r.checkForNewCommit(ctx, workflow, commitInfo, playbook)
 
 		if updated {
 			// New commit - queue this playbook
-			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
+			// Check if playbook is already pending
+			if !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
+				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
+			}
 			workflow.Status.LastTriggerReason = TriggerReasonNewCommit
 			statusUpdated = true
 
@@ -78,8 +72,8 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 			l.Info("Queued playbook for new commit", "type", playbook.Type, "sha", commitInfo.SHA)
 
 			// If apply has new commit, also queue reconcile after it
-			if playbook.Type == "apply" && workflow.Spec.Reconcile != nil {
-				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
+			if playbook.Type == PlaybookTypeApply && workflow.Spec.Reconcile != nil {
+				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 				l.Info("Also queued reconcile after apply")
 			}
 
@@ -108,7 +102,8 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 
 			// Update last scheduled time
 			now := metav1.Now()
-			if playbook.Type == "apply" {
+			switch playbook.Type {
+			case PlaybookTypeApply:
 				if workflow.Status.ApplyScheduleStatus == nil {
 					workflow.Status.ApplyScheduleStatus = &k8siblev1alpha1.ScheduleStatus{}
 				}
@@ -116,10 +111,10 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 
 				// Apply schedule also triggers reconcile after
 				if workflow.Spec.Reconcile != nil {
-					workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, "reconcile")
+					workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 					l.Info("Also queued reconcile after scheduled apply")
 				}
-			} else if playbook.Type == "reconcile" {
+			case PlaybookTypeReconcile:
 				if workflow.Status.ReconcileScheduleStatus == nil {
 					workflow.Status.ReconcileScheduleStatus = &k8siblev1alpha1.ScheduleStatus{}
 				}
@@ -165,7 +160,7 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 		workflow.Status.LastFailedRun != nil &&
 		workflow.Status.LastTriggerReason == TriggerReasonFailureRetry {
 
-		if workflow.Status.LastFailedRun.Type == "apply" && workflow.Status.LastFailedRun.EndTime != nil {
+		if workflow.Status.LastFailedRun.Type == PlaybookTypeApply && workflow.Status.LastFailedRun.EndTime != nil {
 			cooldownEnd := workflow.Status.LastFailedRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
 			if time.Now().Before(cooldownEnd) {
 				l.Info("Apply job in cooldown, waiting",
@@ -180,13 +175,13 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 		// If the last failed job is a reconcile job and the last successful job is an apply job
 		// that occurred at a later date than the reconcile job, don't retrigger a reconcile job
 		// until after the cooldown
-		if workflow.Status.LastFailedRun.Type == "reconcile" &&
+		if workflow.Status.LastFailedRun.Type == PlaybookTypeReconcile &&
 			workflow.Status.LastFailedRun.EndTime != nil &&
 			workflow.Status.LastSuccessfulRun != nil &&
-			workflow.Status.LastSuccessfulRun.Type == "apply" &&
+			workflow.Status.LastSuccessfulRun.Type == PlaybookTypeApply &&
 			workflow.Status.LastSuccessfulRun.EndTime != nil &&
 			workflow.Status.LastSuccessfulRun.EndTime.After(workflow.Status.LastFailedRun.EndTime.Time) &&
-			playbookType == "reconcile" {
+			playbookType == PlaybookTypeReconcile {
 			cooldownEnd := workflow.Status.LastSuccessfulRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
 			if time.Now().Before(cooldownEnd) {
 				l.Info("Reconcile job in cooldown after apply succeeded, waiting",
@@ -231,13 +226,19 @@ func (r *K8sibleWorkflowReconciler) isScheduledRunDue(workflow *k8siblev1alpha1.
 
 	// Get last scheduled time
 	var lastScheduled time.Time
-	if playbook.Type == "apply" && workflow.Status.ApplyScheduleStatus != nil &&
-		workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
-		lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
-	} else if playbook.Type == "reconcile" && workflow.Status.ReconcileScheduleStatus != nil &&
-		workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
-		lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
-	} else {
+	switch playbook.Type {
+	case PlaybookTypeApply:
+		if workflow.Status.ApplyScheduleStatus != nil &&
+			workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
+			lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
+		}
+	case PlaybookTypeReconcile:
+		if workflow.Status.ReconcileScheduleStatus != nil &&
+			workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
+			lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
+		}
+	}
+	if lastScheduled.IsZero() {
 		// If never scheduled, use workflow creation time as baseline
 		lastScheduled = workflow.CreationTimestamp.Time
 	}
@@ -274,13 +275,19 @@ func (r *K8sibleWorkflowReconciler) calculateRequeueAfter(workflow *k8siblev1alp
 
 		// Get last scheduled time
 		var lastScheduled time.Time
-		if playbook.Type == "apply" && workflow.Status.ApplyScheduleStatus != nil &&
-			workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
-			lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
-		} else if playbook.Type == "reconcile" && workflow.Status.ReconcileScheduleStatus != nil &&
-			workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
-			lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
-		} else {
+		switch playbook.Type {
+		case PlaybookTypeApply:
+			if workflow.Status.ApplyScheduleStatus != nil &&
+				workflow.Status.ApplyScheduleStatus.LastScheduledTime != nil {
+				lastScheduled = workflow.Status.ApplyScheduleStatus.LastScheduledTime.Time
+			}
+		case PlaybookTypeReconcile:
+			if workflow.Status.ReconcileScheduleStatus != nil &&
+				workflow.Status.ReconcileScheduleStatus.LastScheduledTime != nil {
+				lastScheduled = workflow.Status.ReconcileScheduleStatus.LastScheduledTime.Time
+			}
+		}
+		if lastScheduled.IsZero() {
 			lastScheduled = workflow.CreationTimestamp.Time
 		}
 
