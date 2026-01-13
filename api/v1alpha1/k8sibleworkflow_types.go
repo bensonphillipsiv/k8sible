@@ -25,6 +25,12 @@ type EnvSecretRef struct {
 	Name string `json:"name"`
 }
 
+// ConfigMapRef references a Kubernetes configmap
+type ConfigMapRef struct {
+	// Name is the name of the configmap
+	Name string `json:"name"`
+}
+
 // SecretRef references a Kubernetes secret
 type SecretRef struct {
 	// Name is the name of the secret
@@ -89,6 +95,11 @@ type K8sibleWorkflowSpec struct {
 	// in the ansible job pod
 	// +optional
 	SecretRef *EnvSecretRef `json:"secretRef,omitempty"`
+
+	// ConfigMapRef references a configmap whose keys will be mounted as environment variables
+	// in the ansible job pod
+	// +optional
+	ConfigMapRef *ConfigMapRef `json:"configMapRef,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run

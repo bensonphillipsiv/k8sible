@@ -140,15 +140,24 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 	// Build environment variables from secret if specified
 	var envFrom []corev1.EnvFromSource
 	if workflow.Spec.SecretRef != nil {
-		envFrom = []corev1.EnvFromSource{
-			{
-				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: workflow.Spec.SecretRef.Name,
-					},
+		envFrom = append(envFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: workflow.Spec.SecretRef.Name,
 				},
 			},
-		}
+		})
+	}
+
+	// Build environment variables from configmap if specified
+	if workflow.Spec.ConfigMapRef != nil {
+		envFrom = append(envFrom, corev1.EnvFromSource{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: workflow.Spec.ConfigMapRef.Name,
+				},
+			},
+		})
 	}
 
 	job := &batchv1.Job{
