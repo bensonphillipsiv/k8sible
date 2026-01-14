@@ -133,7 +133,7 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 	l := logf.FromContext(ctx)
 
 	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
-	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source)
+	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source, workflow.Spec.InventoryPath)
 
 	l.Info("Creating job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries)
 

@@ -93,6 +93,11 @@ spec:
                   If not set, retries happen immediately.
                   Examples: "1h", "30m", "24h"
                 type: string
+              inventoryPath:
+                description: |-
+                  InventoryPath is the path to the inventory file in the repository
+                  Used by ansible-playbook to target remote hosts
+                type: string
               reconcile:
                 description: Reconcile defines the optional reconcile playbook configuration
                 properties:

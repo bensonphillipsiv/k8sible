@@ -229,13 +229,17 @@ func truncateMessage(msg string, maxLen int) string {
 	return msg[:maxLen-3] + "..."
 }
 
-func buildAnsiblePullArgs(source git.Source) []string {
+func buildAnsiblePullArgs(source git.Source, inventoryPath string) []string {
 	args := []string{
 		"-U", source.Repository,
 	}
 
 	if source.Reference != "" {
 		args = append(args, "-C", source.Reference)
+	}
+
+	if inventoryPath != "" {
+		args = append(args, "-i", inventoryPath)
 	}
 
 	args = append(args, source.Path)

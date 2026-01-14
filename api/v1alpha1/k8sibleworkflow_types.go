@@ -100,6 +100,11 @@ type K8sibleWorkflowSpec struct {
 	// in the ansible job pod
 	// +optional
 	ConfigMapRef *ConfigMapRef `json:"configMapRef,omitempty"`
+
+	// InventoryPath is the path to the inventory file in the repository
+	// Used by ansible-playbook to target remote hosts
+	// +optional
+	InventoryPath string `json:"inventoryPath,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run
