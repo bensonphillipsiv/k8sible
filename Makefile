@@ -152,9 +152,8 @@ CHART_DIR ?= charts/k8sible
 HELM ?= helm
 
 .PHONY: helm-crds
-helm-crds: manifests ## Copy CRDs to helm chart
-	@mkdir -p $(CHART_DIR)/crds
-	cp config/crd/bases/*.yaml $(CHART_DIR)/crds/
+helm-crds: manifests ## Copy CRDs to helm chart templates
+	cp config/crd/bases/*.yaml $(CHART_DIR)/templates/crd.yaml
 
 .PHONY: helm-lint
 helm-lint: helm-crds ## Lint helm chart

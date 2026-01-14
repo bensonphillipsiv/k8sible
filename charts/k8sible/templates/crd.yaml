@@ -76,6 +76,17 @@ spec:
                 required:
                 - path
                 type: object
+              configMapRef:
+                description: |-
+                  ConfigMapRef references a configmap whose keys will be mounted as environment variables
+                  in the ansible job pod
+                properties:
+                  name:
+                    description: Name is the name of the configmap
+                    type: string
+                required:
+                - name
+                type: object
               failureCycleCooldown:
                 description: |-
                   FailureCycleCooldown is the duration to wait before retrying after an apply failure.
