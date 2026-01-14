@@ -274,14 +274,12 @@ func (r *K8sibleWorkflowReconciler) handleJobCompletion(ctx context.Context, wor
 func (r *K8sibleWorkflowReconciler) handleApplyFailure(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow) {
 	l := logf.FromContext(ctx)
 
-	l.Info("Apply failed, retrying immediately")
+	l.Info("Apply failed, queuing retry")
 	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonJobFailed,
-		"Apply job failed, retrying immediately")
+		"Apply job failed, queuing retry")
 
-	if !contains(workflow.Status.PendingPlaybooks, PlaybookTypeApply) {
-		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeApply)
-		workflow.Status.LastTriggerReason = TriggerReasonFailureRetry
-	}
+	workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, PlaybookTypeApply)
+	workflow.Status.LastTriggerReason = TriggerReasonFailureRetry
 }
 
 // handleReconcileFailure handles a reconcile job failure after max retries
@@ -300,12 +298,13 @@ func (r *K8sibleWorkflowReconciler) queueApplyAndReconcile(ctx context.Context, 
 	r.Recorder.Eventf(workflow, corev1.EventTypeWarning, EventReasonReconcileTrigger,
 		"Reconcile failed, triggering apply")
 
-	workflow.Status.PendingPlaybooks = []string{PlaybookTypeApply}
+	workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, PlaybookTypeApply)
 	workflow.Status.LastTriggerReason = TriggerReasonFailureRetry
 
 	if workflow.Spec.Reconcile != nil {
-		workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
+		workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 	}
 
+	sortPendingPlaybooks(workflow.Status.PendingPlaybooks)
 	l.Info("Queued apply and reconcile", "pending", workflow.Status.PendingPlaybooks)
 }

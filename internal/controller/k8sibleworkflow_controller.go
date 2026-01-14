@@ -265,6 +265,15 @@ func sortPendingPlaybooks(playbooks []string) {
 	}
 }
 
+// addToPending adds a playbook type to the pending list if not already present
+// Returns true if the playbook was added
+func addToPending(pending []string, playbookType string) []string {
+	if !contains(pending, playbookType) {
+		return append(pending, playbookType)
+	}
+	return pending
+}
+
 func errPlaybookNotFound(playbookType string) error {
 	return &PlaybookNotFoundError{Type: playbookType}
 }

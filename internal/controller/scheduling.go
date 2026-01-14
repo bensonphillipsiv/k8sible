@@ -59,10 +59,7 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 
 		if updated {
 			// New commit - queue this playbook
-			// Check if playbook is already pending
-			if !contains(workflow.Status.PendingPlaybooks, playbook.Type) {
-				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
-			}
+			workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, playbook.Type)
 			workflow.Status.LastTriggerReason = TriggerReasonNewCommit
 			statusUpdated = true
 
@@ -73,7 +70,7 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 
 			// If apply has new commit, also queue reconcile after it
 			if playbook.Type == PlaybookTypeApply && workflow.Spec.Reconcile != nil {
-				workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
+				workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 				l.Info("Also queued reconcile after apply")
 			}
 
@@ -96,7 +93,12 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 		}
 
 		if shouldRun {
-			workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, playbook.Type)
+			// Skip if already pending
+			if contains(workflow.Status.PendingPlaybooks, playbook.Type) {
+				continue
+			}
+
+			workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, playbook.Type)
 			workflow.Status.LastTriggerReason = TriggerReasonSchedule
 			statusUpdated = true
 
@@ -111,7 +113,7 @@ func (r *K8sibleWorkflowReconciler) determineNextJob(ctx context.Context, workfl
 
 				// Apply schedule also triggers reconcile after
 				if workflow.Spec.Reconcile != nil {
-					workflow.Status.PendingPlaybooks = append(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
+					workflow.Status.PendingPlaybooks = addToPending(workflow.Status.PendingPlaybooks, PlaybookTypeReconcile)
 					l.Info("Also queued reconcile after scheduled apply")
 				}
 			case PlaybookTypeReconcile:
@@ -154,43 +156,28 @@ func (r *K8sibleWorkflowReconciler) startNextPendingJob(ctx context.Context, wor
 		return true, nil
 	}
 
-	// If the last apply failed, don't start a new job until the failureCycleCooldown period has passed
-	// unless the trigger reason is a new commit or schedule
+	// Check cooldown for failure retries
+	// Cooldown applies when:
+	// 1. FailureCycleCooldown is configured
+	// 2. There was a recent failure
+	// 3. The trigger is a failure retry (not a new commit or schedule)
 	if workflow.Spec.FailureCycleCooldown != nil &&
 		workflow.Status.LastFailedRun != nil &&
+		workflow.Status.LastFailedRun.EndTime != nil &&
 		workflow.Status.LastTriggerReason == TriggerReasonFailureRetry {
 
-		if workflow.Status.LastFailedRun.Type == PlaybookTypeApply && workflow.Status.LastFailedRun.EndTime != nil {
-			cooldownEnd := workflow.Status.LastFailedRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
-			if time.Now().Before(cooldownEnd) {
-				l.Info("Apply job in cooldown, waiting",
-					"cooldownEnd", cooldownEnd,
-					"timeRemaining", time.Until(cooldownEnd))
-				r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownWaiting,
-					"Apply job in cooldown, next retry at %s", cooldownEnd.Format(time.RFC3339))
-				return false, nil
-			}
-		}
+		cooldownEnd := workflow.Status.LastFailedRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
 
-		// If the last failed job is a reconcile job and the last successful job is an apply job
-		// that occurred at a later date than the reconcile job, don't retrigger a reconcile job
-		// until after the cooldown
-		if workflow.Status.LastFailedRun.Type == PlaybookTypeReconcile &&
-			workflow.Status.LastFailedRun.EndTime != nil &&
-			workflow.Status.LastSuccessfulRun != nil &&
-			workflow.Status.LastSuccessfulRun.Type == PlaybookTypeApply &&
-			workflow.Status.LastSuccessfulRun.EndTime != nil &&
-			workflow.Status.LastSuccessfulRun.EndTime.After(workflow.Status.LastFailedRun.EndTime.Time) &&
-			playbookType == PlaybookTypeReconcile {
-			cooldownEnd := workflow.Status.LastSuccessfulRun.EndTime.Add(workflow.Spec.FailureCycleCooldown.Duration)
-			if time.Now().Before(cooldownEnd) {
-				l.Info("Reconcile job in cooldown after apply succeeded, waiting",
-					"cooldownEnd", cooldownEnd,
-					"timeRemaining", time.Until(cooldownEnd))
-				r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownWaiting,
-					"Reconcile job in cooldown after apply succeeded, next retry at %s", cooldownEnd.Format(time.RFC3339))
-				return false, nil
-			}
+		if time.Now().Before(cooldownEnd) {
+			l.Info("Job in cooldown, waiting",
+				"failedType", workflow.Status.LastFailedRun.Type,
+				"requestedType", playbookType,
+				"cooldownEnd", cooldownEnd,
+				"timeRemaining", time.Until(cooldownEnd))
+			r.Recorder.Eventf(workflow, corev1.EventTypeNormal, EventReasonCooldownWaiting,
+				"%s job in cooldown after %s failure, next retry at %s",
+				playbookType, workflow.Status.LastFailedRun.Type, cooldownEnd.Format(time.RFC3339))
+			return false, nil
 		}
 	}
 
