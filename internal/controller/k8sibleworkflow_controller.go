@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -55,6 +56,12 @@ const (
 	TriggerReasonNewCommit    = "new_commit"
 	TriggerReasonSchedule     = "schedule"
 	TriggerReasonFailureRetry = "failure_retry"
+
+	// Default working directory for git clone
+	DefaultWorkDir = "/tmp/ansible"
+
+	// Default ansible runner image
+	DefaultAnsibleRunnerImage = "ghcr.io/bensonphillipsiv/ansible-runner:latest"
 )
 
 // K8sibleWorkflowReconciler reconciles a K8sibleWorkflow object
@@ -229,22 +236,49 @@ func truncateMessage(msg string, maxLen int) string {
 	return msg[:maxLen-3] + "..."
 }
 
-func buildAnsiblePullArgs(source git.Source, inventoryPath string) []string {
-	args := []string{
-		"-U", source.Repository,
+// buildAnsibleScript creates a shell script that clones the repo and runs ansible-playbook
+func buildAnsibleScript(source git.Source, inventoryPath string) string {
+	// Build the git clone command
+	// If GIT_TOKEN env var is set, use it for authentication
+	script := fmt.Sprintf(`set -e
+		WORKDIR="%s"
+		REPO="%s"
+		PLAYBOOK="%s"
+
+		# Clean up any previous runs
+		rm -rf "${WORKDIR}"
+		mkdir -p "${WORKDIR}"
+
+		# Clone the repository
+		if [ -n "${GIT_TOKEN:-}" ]; then
+			# Insert token into URL for authentication
+			REPO_WITH_AUTH=$(echo "${REPO}" | sed "s|https://|https://oauth2:${GIT_TOKEN}@|")
+			git clone "${REPO_WITH_AUTH}" "${WORKDIR}/repo"
+		else
+			git clone "${REPO}" "${WORKDIR}/repo"
+		fi
+
+		cd "${WORKDIR}/repo"
+		`, DefaultWorkDir, source.Repository, source.Path)
+
+	// Add checkout command if reference is specified
+	if source.Reference != "" {
+		script += fmt.Sprintf(`
+			# Checkout the specified reference
+			git checkout %s
+			`, source.Reference)
 	}
 
-	if source.Reference != "" {
-		args = append(args, "-C", source.Reference)
-	}
+	// Build the ansible-playbook command
+	script += `ansible-playbook`
 
 	if inventoryPath != "" {
-		args = append(args, "-i", inventoryPath)
+		script += fmt.Sprintf(` -i "%s"`, inventoryPath)
 	}
 
-	args = append(args, source.Path)
+	script += ` "${PLAYBOOK}"`
 
-	return args
+	return script
 }
 
 func contains(slice []string, item string) bool {

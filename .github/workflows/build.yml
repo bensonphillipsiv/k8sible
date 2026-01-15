@@ -44,7 +44,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Docker
+      - name: Extract metadata for Docker (controller)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -57,7 +57,20 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      - name: Extract metadata for Docker (ansible-runner)
+        id: meta-ansible
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/ansible-runner
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push controller image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -66,4 +79,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Build and push ansible-runner image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ansible-runner
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta-ansible.outputs.tags }}
+          labels: ${{ steps.meta-ansible.outputs.labels }}
+          cache-from: type=gha,scope=ansible-runner
+          cache-to: type=gha,mode=max,scope=ansible-runner
           platforms: linux/amd64

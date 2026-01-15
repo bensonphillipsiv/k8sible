@@ -128,12 +128,12 @@ func (r *K8sibleWorkflowReconciler) processCompletedJobs(ctx context.Context, wo
 	return statusUpdated, nil
 }
 
-// createJob creates a new ansible-pull job
+// createJob creates a new ansible job
 func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8siblev1alpha1.K8sibleWorkflow, playbook Playbook) error {
 	l := logf.FromContext(ctx)
 
 	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
-	ansiblePullArgs := buildAnsiblePullArgs(playbook.Source, workflow.Spec.InventoryPath)
+	script := buildAnsibleScript(playbook.Source, workflow.Spec.InventoryPath)
 
 	l.Info("Creating job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries)
 
@@ -185,10 +185,10 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
-							Name:    "ansible",
-							Image:   "quay.io/ansible/ansible-runner:latest",
-							Command: []string{"ansible-pull"},
-							Args:    ansiblePullArgs,
+							Name:    "ansible-runner",
+							Image:   DefaultAnsibleRunnerImage,
+							Command: []string{"/bin/bash", "-c"},
+							Args:    []string{script},
 							EnvFrom: envFrom,
 						},
 					},
