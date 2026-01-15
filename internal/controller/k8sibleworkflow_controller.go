@@ -245,6 +245,9 @@ func buildAnsibleScript(source git.Source, inventoryPath string) string {
 		REPO="%s"
 		PLAYBOOK="%s"
 
+		# Disable SSH host key checking for ephemeral containers
+		export ANSIBLE_HOST_KEY_CHECKING=False
+
 		# Clean up any previous runs
 		rm -rf "${WORKDIR}"
 		mkdir -p "${WORKDIR}"
@@ -276,6 +279,13 @@ func buildAnsibleScript(source git.Source, inventoryPath string) string {
 		// Use envsubst to substitute environment variables in the inventory file
 		script += fmt.Sprintf(`# Process inventory file with envsubst to substitute environment variables
 			envsubst < "%s" > "${WORKDIR}/inventory"
+
+			# Verify inventory file is not empty after substitution
+			if [ ! -s "${WORKDIR}/inventory" ]; then
+				echo "ERROR: Inventory file is empty after environment variable substitution"
+				exit 1
+			fi
+
 			ansible-playbook -i "${WORKDIR}/inventory" "${PLAYBOOK}"
 			`, inventoryPath)
 	} else {
