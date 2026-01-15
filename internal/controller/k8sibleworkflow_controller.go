@@ -270,13 +270,17 @@ func buildAnsibleScript(source git.Source, inventoryPath string) string {
 	}
 
 	// Build the ansible-playbook command
-	script += `ansible-playbook`
+	script += `# Run ansible-playbook`
 
 	if inventoryPath != "" {
-		script += fmt.Sprintf(` -i "%s"`, inventoryPath)
+		// Use envsubst to substitute environment variables in the inventory file
+		script += fmt.Sprintf(`# Process inventory file with envsubst to substitute environment variables
+			envsubst < "%s" > "${WORKDIR}/inventory"
+			ansible-playbook -i "${WORKDIR}/inventory" "${PLAYBOOK}"
+			`, inventoryPath)
+	} else {
+		script += `ansible-playbook "${PLAYBOOK}"`
 	}
-
-	script += ` "${PLAYBOOK}"`
 
 	return script
 }
