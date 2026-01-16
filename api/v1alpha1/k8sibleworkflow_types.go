@@ -105,6 +105,14 @@ type K8sibleWorkflowSpec struct {
 	// Used by ansible-playbook to target remote hosts
 	// +optional
 	InventoryPath string `json:"inventoryPath,omitempty"`
+
+	// Verbosity sets the ansible-playbook verbosity level (0-4)
+	// 0 = no extra output, 1 = -v, 2 = -vv, 3 = -vvv, 4 = -vvvv
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4
+	// +kubebuilder:default=0
+	Verbosity int32 `json:"verbosity,omitempty"`
 }
 
 // PlaybookRunStatus represents the status of a playbook run

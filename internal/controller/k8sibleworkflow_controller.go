@@ -237,7 +237,16 @@ func truncateMessage(msg string, maxLen int) string {
 }
 
 // buildAnsibleScript creates a shell script that clones the repo and runs ansible-playbook
-func buildAnsibleScript(source git.Source, inventoryPath string) string {
+func buildAnsibleScript(source git.Source, inventoryPath string, verbosity int32) string {
+	// Build verbosity flag
+	verbosityFlag := ""
+	if verbosity > 0 {
+		verbosityFlag = " -"
+		for i := int32(0); i < verbosity; i++ {
+			verbosityFlag += "v"
+		}
+	}
+
 	// Build the git clone command
 	// If GIT_TOKEN env var is set, use it for authentication
 	script := fmt.Sprintf(`set -e
@@ -286,10 +295,10 @@ func buildAnsibleScript(source git.Source, inventoryPath string) string {
 				exit 1
 			fi
 
-			ansible-playbook -i "${WORKDIR}/inventory" "${PLAYBOOK}"
-			`, inventoryPath)
+			ansible-playbook%s -i "${WORKDIR}/inventory" "${PLAYBOOK}"
+			`, inventoryPath, verbosityFlag)
 	} else {
-		script += `ansible-playbook "${PLAYBOOK}"`
+		script += fmt.Sprintf(`ansible-playbook%s "${PLAYBOOK}"`, verbosityFlag)
 	}
 
 	return script

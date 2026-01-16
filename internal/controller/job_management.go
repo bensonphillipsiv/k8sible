@@ -133,9 +133,9 @@ func (r *K8sibleWorkflowReconciler) createJob(ctx context.Context, workflow *k8s
 	l := logf.FromContext(ctx)
 
 	jobName := fmt.Sprintf("ansible-%s-%s-%d", workflow.Name, playbook.Type, time.Now().Unix())
-	script := buildAnsibleScript(playbook.Source, workflow.Spec.InventoryPath)
+	script := buildAnsibleScript(playbook.Source, workflow.Spec.InventoryPath, workflow.Spec.Verbosity)
 
-	l.Info("Creating job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries)
+	l.Info("Creating job", "job", jobName, "type", playbook.Type, "backoffLimit", playbook.MaxRetries, "verbosity", workflow.Spec.Verbosity)
 
 	// Build environment variables from secret if specified
 	var envFrom []corev1.EnvFromSource

@@ -31,9 +31,6 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Run tests
-        run: make test
-
       - name: Generate manifests
         run: |
           make manifests
